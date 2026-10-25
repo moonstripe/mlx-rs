@@ -45,6 +45,8 @@ macro_rules! assert_not_impl_any {
 }
 
 assert_not_impl_any!(GgufFile: Clone, Send, Sync);
+#[cfg(feature = "metal")]
+assert_not_impl_any!(fast::MetalKernel: Clone, Send, Sync);
 
 fn gguf_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = tempfile::tempdir().unwrap();
@@ -360,6 +362,7 @@ fn rms_norm_absence_handles_are_freed_after_each_call() {
     }
 }
 
+#[cfg(feature = "metal")]
 #[test]
 fn metal_kernel_handles_are_released_on_every_path() {
     let output = [fast::MetalKernelOutput {
@@ -384,15 +387,17 @@ fn metal_kernel_handles_are_released_on_every_path() {
             ..Default::default()
         };
         let result = with_stream(&Stream::gpu(), || {
-            kernel.apply(&[&input], &output, (4, 1, 1), (4, 1, 1), options.clone())
+            // SAFETY: Four threads copy distinct f32 elements within both four-element buffers.
+            unsafe { kernel.apply(&[&input], &output, (4, 1, 1), (4, 1, 1), options.clone()) }
         })
         .unwrap();
         result[0].eval().unwrap();
 
         let no_inputs: [&Array; 0] = [];
-        assert!(kernel
-            .apply(&no_inputs, &output, (4, 1, 1), (4, 1, 1), options)
-            .is_err());
+        // SAFETY: The input count mismatch is rejected before any kernel can execute.
+        assert!(
+            unsafe { kernel.apply(&no_inputs, &output, (4, 1, 1), (4, 1, 1), options) }.is_err()
+        );
     }
 }
 

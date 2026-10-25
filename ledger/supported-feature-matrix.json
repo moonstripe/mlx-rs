@@ -142,7 +142,11 @@
         "test": "mlx-rs/src/fast.rs#test_metal_kernel_template_args_and_shapes (inline expected values)",
         "leaks": "mlx-tests/tests/ffi_safety.rs",
         "guard_malloc": "mlx-tests/tests/ffi_safety.rs"
-      }
+      },
+      "api_feature_sets": [
+        "default",
+        "safetensors"
+      ]
     }
   ],
   "builds": [

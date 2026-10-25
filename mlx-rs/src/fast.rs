@@ -1,11 +1,19 @@
 //! Fast implementations of commonly used multi-op functions.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
+#[cfg(feature = "metal")]
+use std::ffi::CString;
 
-use crate::error::{Exception, Result};
+#[cfg(feature = "metal")]
+use crate::error::Exception;
+use crate::error::Result;
 use crate::utils::guard::Guarded;
-use crate::utils::{IntoOption, SUCCESS};
-use crate::{Array, Dtype, Stream};
+use crate::utils::IntoOption;
+#[cfg(feature = "metal")]
+use crate::utils::SUCCESS;
+#[cfg(feature = "metal")]
+use crate::Dtype;
+use crate::{Array, Stream};
 use mlx_internal_macros::generate_macro;
 
 /// Optimized implementation of `NN.RoPE`.
@@ -336,6 +344,7 @@ pub fn layer_norm_device<'a>(
 /// Each argument is emitted as a template parameter of the generated `[[kernel]]` function, so
 /// the kernel source can refer to it by name (for example `T`, `N` or `USE_BIAS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "metal")]
 pub enum TemplateArg {
     /// A type parameter, emitted as the matching Metal type (for example `float`).
     Dtype(Dtype),
@@ -347,6 +356,7 @@ pub enum TemplateArg {
 
 /// Construction options for [`MetalKernel::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "metal")]
 pub struct MetalKernelOptions {
     /// Metal source placed before the generated kernel, such as helper functions or includes.
     pub header: String,
@@ -357,6 +367,7 @@ pub struct MetalKernelOptions {
     pub atomic_outputs: bool,
 }
 
+#[cfg(feature = "metal")]
 impl Default for MetalKernelOptions {
     fn default() -> Self {
         Self {
@@ -369,6 +380,7 @@ impl Default for MetalKernelOptions {
 
 /// The shape and dtype of one [`MetalKernel`] output.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "metal")]
 pub struct MetalKernelOutput {
     /// Output shape.
     pub shape: Vec<i32>,
@@ -378,6 +390,7 @@ pub struct MetalKernelOutput {
 
 /// Independent per-call options for [`MetalKernel::apply`].
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg(feature = "metal")]
 pub struct MetalKernelApplyOptions {
     /// Template parameters, in declaration order.
     pub template_args: Vec<(String, TemplateArg)>,
@@ -410,20 +423,23 @@ pub struct MetalKernelApplyOptions {
 ///     MetalKernelOptions::default(),
 /// )?;
 /// let a = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
-/// let out = kernel.apply(
+/// // SAFETY: Four threads read four f32 inputs and initialize distinct f32 outputs.
+/// let out = unsafe { kernel.apply(
 ///     &[&a],
 ///     &[MetalKernelOutput { shape: vec![4], dtype: Dtype::Float32 }],
 ///     (4, 1, 1),
 ///     (4, 1, 1),
 ///     MetalKernelApplyOptions::default(),
-/// )?;
+/// ) }?;
 /// assert_eq!(out[0].as_slice::<f32>(), &[2.0, 4.0, 6.0, 8.0]);
 /// # Ok::<(), mlx_rs::error::Exception>(())
 /// ```
+#[cfg(feature = "metal")]
 pub struct MetalKernel {
     raw: mlx_sys::mlx_fast_metal_kernel,
 }
 
+#[cfg(feature = "metal")]
 impl MetalKernel {
     /// Builds a kernel from its name, input and output names, and Metal body `source`.
     ///
@@ -468,7 +484,15 @@ impl MetalKernel {
     /// `inputs` and `outputs` must match the counts given at construction. Like other
     /// operations the result is lazy; the kernel compiles and runs when the outputs are
     /// evaluated.
-    pub fn apply(
+    ///
+    /// # Safety
+    ///
+    /// For the given inputs, outputs, template arguments and launch configuration, the kernel
+    /// must only access memory inside the input and output buffers and must never write an input.
+    /// It must write every output element before it is read unless `init_value` is set, only
+    /// write values valid for the output dtype, and have no unsynchronized conflicting accesses.
+    /// These requirements apply throughout deferred execution.
+    pub unsafe fn apply(
         &self,
         inputs: &[impl AsRef<Array>],
         outputs: &[MetalKernelOutput],
@@ -564,22 +588,26 @@ impl MetalKernel {
     }
 }
 
+#[cfg(feature = "metal")]
 impl Drop for MetalKernel {
     fn drop(&mut self) {
         unsafe { mlx_sys::mlx_fast_metal_kernel_free(self.raw) };
     }
 }
 
+#[cfg(feature = "metal")]
 impl std::fmt::Debug for MetalKernel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetalKernel").finish_non_exhaustive()
     }
 }
 
+#[cfg(feature = "metal")]
 struct KernelConfig {
     raw: mlx_sys::mlx_fast_metal_kernel_config,
 }
 
+#[cfg(feature = "metal")]
 impl KernelConfig {
     fn new() -> Result<Self> {
         let raw = unsafe { mlx_sys::mlx_fast_metal_kernel_config_new() };
@@ -601,16 +629,19 @@ impl KernelConfig {
     }
 }
 
+#[cfg(feature = "metal")]
 impl Drop for KernelConfig {
     fn drop(&mut self) {
         unsafe { mlx_sys::mlx_fast_metal_kernel_config_free(self.raw) };
     }
 }
 
+#[cfg(feature = "metal")]
 struct StringVector {
     raw: mlx_sys::mlx_vector_string,
 }
 
+#[cfg(feature = "metal")]
 impl StringVector {
     fn new(values: &[&str]) -> Result<Self> {
         let owned = values
@@ -631,12 +662,14 @@ impl StringVector {
     }
 }
 
+#[cfg(feature = "metal")]
 impl Drop for StringVector {
     fn drop(&mut self) {
         let _ = unsafe { mlx_sys::mlx_vector_string_free(self.raw) };
     }
 }
 
+#[cfg(feature = "metal")]
 fn c_string(value: &str) -> Result<CString> {
     CString::new(value).map_err(|error| Exception::custom(error.to_string()))
 }
@@ -820,7 +853,8 @@ mod tests {
         .unwrap();
         let a = &crate::ops::arange::<_, f32>(None, 8, None).unwrap() / 4.0;
         let b = Array::from_slice(&[0.5_f32], &[1]);
-        let outputs = crate::with_device(crate::Device::gpu(), || {
+        // SAFETY: Eight threads read valid inputs and initialize distinct outputs of matching dtypes.
+        let outputs = crate::with_device(crate::Device::gpu(), || unsafe {
             kernel.apply(
                 &[&a, &b],
                 &[
@@ -867,7 +901,8 @@ mod tests {
         )
         .unwrap();
         let a = Array::from_slice(&[0.0_f32, 0.25, 0.5, 0.75], &[4]);
-        let out = crate::with_device(crate::Device::gpu(), || {
+        // SAFETY: Threads 0 and 1 copy valid f32 elements; init_value initializes the rest.
+        let out = crate::with_device(crate::Device::gpu(), || unsafe {
             kernel.apply(
                 &[&a],
                 &[MetalKernelOutput {
@@ -889,6 +924,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metal")]
     #[test]
     fn test_metal_kernel_rejects_invalid_arguments() {
         let error = MetalKernel::new("none", &["a"], &[], "", MetalKernelOptions::default())
@@ -910,19 +946,22 @@ mod tests {
         }];
         let a = Array::from_slice(&[1.0_f32], &[1]);
         let no_inputs: [&Array; 0] = [];
-        let error = kernel
-            .apply(
+        // SAFETY: The input count mismatch is rejected before any kernel can execute.
+        let error = unsafe {
+            kernel.apply(
                 &no_inputs,
                 &output,
                 (1, 1, 1),
                 (1, 1, 1),
                 Default::default(),
             )
-            .expect_err("input count must match construction");
+        }
+        .expect_err("input count must match construction");
         assert!(error.what().contains("`inputs`"));
 
         let error = crate::with_device(crate::Device::cpu(), || {
-            kernel.apply(&[&a], &output, (1, 1, 1), (1, 1, 1), Default::default())
+            // SAFETY: One thread copies one f32 between single-element buffers.
+            unsafe { kernel.apply(&[&a], &output, (1, 1, 1), (1, 1, 1), Default::default()) }
         })
         .expect_err("custom Metal kernels only run on the GPU");
         assert!(error.what().contains("[metal_kernel]"));
