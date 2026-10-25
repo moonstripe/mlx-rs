@@ -48,7 +48,11 @@
         "api": "mlx-rs/src/metal.rs",
         "distribution": "mlx-sys/build.rs",
         "test": "mlx-rs/src/metal.rs#metallib_path_roundtrips"
-      }
+      },
+      "api_feature_sets": [
+        "default",
+        "safetensors"
+      ]
     },
     {
       "feature": "memory-control",
@@ -89,8 +93,7 @@
       "feature": "slice-update",
       "canonical_path": "mlx_rs::ops::indexing::TryIndexUpdateOp",
       "symbols": {
-        "mlx_slice_update": "wrapped by UpdateMode::Replace through the canonical functional index-update path",
-        "mlx_slice_update_dynamic": "deferred because runtime start arrays provide replacement-only semantics and do not compose with Rust ArrayIndex slice syntax or the five-mode family"
+        "mlx_slice_update": "mlx_rs::ops::indexing::TryIndexUpdateOp::try_index_update and mlx_rs::ops::indexing::UpdateMode::Replace"
       },
       "evidence": {
         "conformance": "conformance/suites/indexing.json",
@@ -98,20 +101,23 @@
         "leaks": "mlx-tests/tests/ffi_safety.rs",
         "guard_malloc": "mlx-tests/tests/ffi_safety.rs",
         "qualification": "conformance/qualification.json"
+      },
+      "deferred_symbols": {
+        "mlx_slice_update_dynamic": "deferred because runtime start arrays provide replacement-only semantics and do not compose with Rust ArrayIndex slice syntax or the five-mode family"
       }
     },
     {
       "feature": "mlx-lm-oracle-gate",
-      "canonical_path": "mlx-lm/tests/parity.rs",
       "status": "tranche-1-gate-only",
       "evidence": {
         "contract": "conformance/mlx-lm/SCHEMA.md",
         "qualification": "mlx-lm/tests/parity/mutations.rs",
         "prototype": "mlx-lm/tests/parity/prototype.rs",
-        "ledger": "ledger/mlx-lm-parity.json",
-        "verification": "cargo run -p xtask -- verify-lm-parity",
+        "decisions": "mlx-lm/SUPPORT.md",
+        "verification": "cargo test -p mlx-lm --features oracle-hooks --test parity -- --test-threads=1",
         "fixture_runtime": "mlx-lm/tests/parity.rs: committed_fixture_layout_and_policies and prototype_llama_base_prefill_cache_and_greedy_parity; each prints NOT RUN on stderr when conformance/mlx-lm/fixtures is absent"
-      }
+      },
+      "test_path": "mlx-lm/tests/parity.rs"
     },
     {
       "feature": "metal-kernel",
@@ -133,8 +139,7 @@
       },
       "evidence": {
         "api": "mlx-rs/src/fast.rs",
-        "test": "mlx-rs/src/fast.rs#test_metal_kernel_template_args_and_shapes",
-        "oracle": "Python MLX 0.32 mx.fast.metal_kernel outputs recorded in mlx-rs/src/fast.rs tests",
+        "test": "mlx-rs/src/fast.rs#test_metal_kernel_template_args_and_shapes (inline expected values)",
         "leaks": "mlx-tests/tests/ffi_safety.rs",
         "guard_malloc": "mlx-tests/tests/ffi_safety.rs"
       }
@@ -152,10 +157,101 @@
         "build",
         "test"
       ],
-      "purpose": "CPU-only Accelerate configuration used by sandboxed verification"
+      "purpose": "CPU-only Accelerate configuration",
+      "required": true,
+      "profile": "debug",
+      "toolchain": "stable",
+      "packages": [
+        "mlx-rs",
+        "mlx-tests"
+      ],
+      "native": {
+        "MLX_BUILD_METAL": "OFF",
+        "MLX_BUILD_ACCELERATE": "ON",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MLX_METAL_JIT": "OFF"
+      },
+      "allow_empty": [
+        "mlx-tests::doctest::mlx_tests",
+        "mlx-tests::lib::mlx_tests",
+        "mlx-tests::test::ci_leak_calibration",
+        "mlx-tests::test::common",
+        "mlx-tests::test::test_quantizable"
+      ],
+      "resolved_features": {
+        "mlx-rs": [
+          "accelerate"
+        ],
+        "mlx-sys": [
+          "accelerate"
+        ],
+        "mlx-tests": [
+          "accelerate"
+        ]
+      },
+      "checkpoints_required": false
     },
     {
       "id": "macos-arm64-default",
+      "target_triple": "aarch64-apple-darwin",
+      "default_features": true,
+      "features": [
+        "accelerate",
+        "metal",
+        "mlx-lm/oracle-hooks"
+      ],
+      "verification": [
+        "build",
+        "test"
+      ],
+      "purpose": "Default supported macOS arm64 configuration with Accelerate and Metal",
+      "required": true,
+      "profile": "debug",
+      "toolchain": "stable",
+      "packages": [],
+      "native": {
+        "MLX_BUILD_METAL": "ON",
+        "MLX_BUILD_ACCELERATE": "ON",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MLX_METAL_JIT": "OFF"
+      },
+      "allow_empty": [
+        "mlx-internal-macros::doctest::mlx_internal_macros",
+        "mlx-internal-macros::lib::mlx_internal_macros",
+        "mlx-macros::doctest::mlx_macros",
+        "mlx-macros::lib::mlx_macros",
+        "mlx-sys::doctest::mlx_sys",
+        "mlx-tests::doctest::mlx_tests",
+        "mlx-tests::lib::mlx_tests",
+        "mlx-tests::test::ci_leak_calibration",
+        "mlx-tests::test::common",
+        "mlx-tests::test::test_quantizable"
+      ],
+      "resolved_features": {
+        "mlx-rs": [
+          "accelerate",
+          "default",
+          "metal"
+        ],
+        "mlx-sys": [
+          "accelerate",
+          "default",
+          "metal"
+        ],
+        "mlx-tests": [
+          "accelerate",
+          "default",
+          "metal"
+        ],
+        "mlx-lm": [
+          "default",
+          "oracle-hooks"
+        ]
+      },
+      "checkpoints_required": true
+    },
+    {
+      "id": "macos-arm64-default-msrv",
       "target_triple": "aarch64-apple-darwin",
       "default_features": true,
       "features": [
@@ -166,7 +262,149 @@
         "build",
         "test"
       ],
-      "purpose": "Default supported macOS arm64 configuration with Accelerate and Metal"
+      "purpose": "Default macOS arm64 configuration on the minimum supported Rust version",
+      "required": true,
+      "profile": "debug",
+      "toolchain": "1.88.0",
+      "packages": [],
+      "native": {
+        "MLX_BUILD_METAL": "ON",
+        "MLX_BUILD_ACCELERATE": "ON",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MLX_METAL_JIT": "OFF"
+      },
+      "allow_empty": [
+        "mlx-internal-macros::doctest::mlx_internal_macros",
+        "mlx-internal-macros::lib::mlx_internal_macros",
+        "mlx-macros::doctest::mlx_macros",
+        "mlx-macros::lib::mlx_macros",
+        "mlx-sys::doctest::mlx_sys",
+        "mlx-tests::doctest::mlx_tests",
+        "mlx-tests::lib::mlx_tests",
+        "mlx-tests::test::ci_leak_calibration",
+        "mlx-tests::test::common",
+        "mlx-tests::test::test_quantizable"
+      ],
+      "resolved_features": {
+        "mlx-rs": [
+          "accelerate",
+          "default",
+          "metal"
+        ],
+        "mlx-sys": [
+          "accelerate",
+          "default",
+          "metal"
+        ],
+        "mlx-tests": [
+          "accelerate",
+          "default",
+          "metal"
+        ]
+      },
+      "checkpoints_required": false
+    },
+    {
+      "id": "macos-arm64-cpu-only-release",
+      "target_triple": "aarch64-apple-darwin",
+      "default_features": false,
+      "features": [
+        "accelerate"
+      ],
+      "verification": [
+        "build",
+        "test"
+      ],
+      "purpose": "CPU-only Accelerate configuration with the release profile",
+      "required": true,
+      "profile": "release",
+      "toolchain": "stable",
+      "packages": [
+        "mlx-rs",
+        "mlx-tests"
+      ],
+      "native": {
+        "MLX_BUILD_METAL": "OFF",
+        "MLX_BUILD_ACCELERATE": "ON",
+        "CMAKE_BUILD_TYPE": "Release",
+        "MLX_METAL_JIT": "OFF"
+      },
+      "allow_empty": [
+        "mlx-tests::doctest::mlx_tests",
+        "mlx-tests::lib::mlx_tests",
+        "mlx-tests::test::ci_leak_calibration",
+        "mlx-tests::test::common",
+        "mlx-tests::test::test_quantizable"
+      ],
+      "resolved_features": {
+        "mlx-rs": [
+          "accelerate"
+        ],
+        "mlx-sys": [
+          "accelerate"
+        ],
+        "mlx-tests": [
+          "accelerate"
+        ]
+      },
+      "checkpoints_required": false
+    },
+    {
+      "id": "macos-arm64-metal-jit",
+      "target_triple": "aarch64-apple-darwin",
+      "default_features": true,
+      "features": [
+        "accelerate",
+        "metal",
+        "metal-jit"
+      ],
+      "verification": [
+        "build",
+        "test"
+      ],
+      "purpose": "Default macOS arm64 configuration with Metal JIT compilation",
+      "required": true,
+      "profile": "debug",
+      "toolchain": "stable",
+      "packages": [],
+      "native": {
+        "MLX_BUILD_METAL": "ON",
+        "MLX_BUILD_ACCELERATE": "ON",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MLX_METAL_JIT": "ON"
+      },
+      "allow_empty": [
+        "mlx-internal-macros::doctest::mlx_internal_macros",
+        "mlx-internal-macros::lib::mlx_internal_macros",
+        "mlx-macros::doctest::mlx_macros",
+        "mlx-macros::lib::mlx_macros",
+        "mlx-sys::doctest::mlx_sys",
+        "mlx-tests::doctest::mlx_tests",
+        "mlx-tests::lib::mlx_tests",
+        "mlx-tests::test::ci_leak_calibration",
+        "mlx-tests::test::common",
+        "mlx-tests::test::test_quantizable"
+      ],
+      "resolved_features": {
+        "mlx-rs": [
+          "accelerate",
+          "default",
+          "metal",
+          "metal-jit"
+        ],
+        "mlx-sys": [
+          "accelerate",
+          "default",
+          "metal",
+          "metal-jit"
+        ],
+        "mlx-tests": [
+          "accelerate",
+          "default",
+          "metal"
+        ]
+      },
+      "checkpoints_required": false
     }
   ]
 }

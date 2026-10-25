@@ -142,15 +142,12 @@ conformance/.venv-mlx-lm/bin/python -B conformance/mlx-lm/text_reference.py --ch
 conformance/.venv-mlx-lm/bin/python -B conformance/mlx-lm/numpy_reference/run.py
 conformance/.venv-mlx-lm/bin/python -B conformance/mlx-lm/coordinate.py
 cargo test -p mlx-lm --features oracle-hooks --test parity -- --test-threads=1
-cargo run -p xtask -- verify-lm-parity
-cargo run -p xtask -- api-baseline --crate mlx-lm --check ledger/mlx-lm-api-baseline.json
-cargo run -p xtask -- verify-oracle-boundary --base 919622fd56fddf0268b5db22c88a2618a0bc2a1a
+cargo xtask verify-oracle-boundary --base 919622fd56fddf0268b5db22c88a2618a0bc2a1a
 ```
 
-`api-baseline` defaults to mlx-rs. Select mlx-lm with `--crate mlx-lm`, write
-with `--out PATH`, or compare bytes with `--check PATH`. Check mode never
-rewrites the baseline and rejects drift. The core baseline is independent of
-the mlx-lm one.
+`api-baseline` extracts only the compiled mlx-rs API. The mlx-lm
+[support decisions](../../mlx-lm/SUPPORT.md) define its supported subset;
+executed parity tests and external feature consumers provide its verification.
 
 The Python-side tests for the text reference and the generator contract run
 under the pinned interpreter without extra packages:
@@ -225,8 +222,8 @@ Pure generation, comparator qualification and source/corpus checking:
 ```sh
 conformance/.venv-mlx-lm/bin/python -B -m unittest discover -s conformance/mlx-lm -p 'test_*.py'
 python3 -B conformance/mlx-lm/generate_contracts.py --check --qualify
-cargo test --offline -p xtask verify_lm_features
-cargo run --offline -p xtask -- verify-lm-features
+cargo test --offline --manifest-path xtask/Cargo.toml verify_lm_features
+cargo --offline xtask verify-lm-features
 ```
 
 Capture and freeze only these additions on the pinned MLX host:
@@ -523,3 +520,14 @@ The local release runs remain unexecuted until the launcher records the Python
 matrix, Rust matrix, baseline, unmodified Metal user path, and any required
 ablation/profile evidence. Compilation and pure checks do not qualify real model
 parity or performance.
+
+## Bump checkpoint contract
+
+`bump-oracle.json` retains the case/device inventory, prompts and prompt IDs,
+generation parameters, pinned checkpoint revisions and file hashes, tokenizer
+entries, and oracle environment pins. It contains no numerical results.
+`xtask/provision_checkpoints.py` verifies cached inputs and runs `live_oracle.py`
+with the pinned Python environment to generate expectations on the runner.
+Rust compares all six checkpoint cases on CPU and Metal against that live report.
+See [the bump playbook](../../VERIFICATION.md#repeatable-mlx-c-bump-playbook)
+for provisioning and execution commands.

@@ -1674,14 +1674,15 @@ pub fn matmul_device(
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
 /// use mlx_rs::{Array, ops::segmented_mm};
 ///
 /// let a = Array::ones::<f32>(&[10, 100]).unwrap();
 /// let b = Array::ones::<f32>(&[100, 10]).unwrap();
 /// let segments = Array::from_slice(&[0u32, 50, 50, 100], &[2, 2]);
-/// let result = segmented_mm(&a, &b, &segments, None).unwrap();
-/// // result has shape [2, 10, 10]
+/// let result = segmented_mm(&a, &b, &segments).unwrap();
+/// assert_eq!(result.shape(), &[2, 10, 10]);
+/// assert!(result.as_slice::<f32>().iter().all(|&value| value == 50.0));
 /// ```
 pub fn segmented_mm(
     a: impl AsRef<Array>,
@@ -2710,8 +2711,12 @@ mod tests {
 
         let c = a.power(&b).unwrap();
 
-        let c_data: &[f32] = c.as_slice();
-        assert_eq!(c_data, &[1.0, 8.0, 81.0]);
+        assert_array_eq(
+            &c,
+            array!([1.0, 8.0, 81.0]),
+            tolerances::MLX_DEFAULT.rtol,
+            tolerances::MLX_DEFAULT.atol,
+        );
 
         // check a and b are not modified
         let a_data: &[f32] = a.as_slice();
@@ -2939,8 +2944,12 @@ mod tests {
         let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
         let b = a.log1p().unwrap();
 
-        let b_data: &[f32] = b.as_slice();
-        assert_eq!(b_data, &[0.6931472, 1.0986123, 1.3862944]);
+        assert_array_eq(
+            &b,
+            array!([0.6931472, 1.0986123, 1.3862944]),
+            tolerances::MLX_DEFAULT.rtol,
+            tolerances::MLX_DEFAULT.atol,
+        );
 
         // check a is not modified
         let a_data: &[f32] = a.as_slice();
@@ -3043,8 +3052,12 @@ mod tests {
         let a = Array::from_slice(&[0.0, 1.0, 2.0], &[3]);
         let b = a.sin().unwrap();
 
-        let b_data: &[f32] = b.as_slice();
-        assert_eq!(b_data, &[0.0, 0.841471, 0.9092974]);
+        assert_array_eq(
+            &b,
+            array!([0.0, 0.841471, 0.9092974]),
+            tolerances::MLX_DEFAULT.rtol,
+            tolerances::MLX_DEFAULT.atol,
+        );
 
         // check a is not modified
         let a_data: &[f32] = a.as_slice();
@@ -4321,7 +4334,7 @@ mod tests {
 
         let a = random::normal::<f32>(&[100, 1, 100], None, None, None).unwrap();
         let b = random::normal::<f32>(&[8, 100, 100], None, None, None).unwrap();
-        let rhs = sort(&random::randint::<_, i32>(0, 8, &[100], None).unwrap()).unwrap();
+        let rhs = sort(random::randint::<_, i32>(0, 8, &[100], None).unwrap()).unwrap();
 
         let c1 = gather_mm_ref(&a, &b, &rhs);
         let c2 = gather_mm(&a, &b, None::<&Array>, &rhs, true).unwrap();

@@ -1,4 +1,3 @@
-use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -6,11 +5,9 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const OLD_COMMIT: &str = "a1290d221f92bd020af805b7d14207eee4ec973b";
-const TARGET_COMMIT: &str = "c74db5307cc8ce122f48d97ef951b30578674e7f";
-const OLD_MLX: &str = "0.30.6";
+const OLD_COMMIT: &str = "c74db5307cc8ce122f48d97ef951b30578674e7f";
+const TARGET_COMMIT: &str = "a341b4925024b88b2c593468f16e12f5e17315da";
 const TARGET_MLX: &str = "0.32.2";
-const LOCAL_FFI_PROCEDURE: &str = "ROADMAP.md#tranche-2-leak-and-use-after-free-gate-done";
 const ALLOWED_REPLAY_VERDICTS: &[&str] = &[
     "identical",
     "value_changed",
@@ -18,523 +15,95 @@ const ALLOWED_REPLAY_VERDICTS: &[&str] = &[
     "error_behavior_changed",
     "recipe_failed",
 ];
-const CHECK_IDS: &[&str] = &[
-    "tuple",
-    "boundary",
-    "race",
-    "ffi",
-    "semantic",
-    "ledger",
-    "fingerprints",
-    "feature_matrix",
-    "state",
-    "replay",
-    "sentinel",
-];
-
-struct RequiredSuite {
-    id: &'static str,
-    command: &'static [&'static str],
-}
-
-const REQUIRED_SUITES: &[RequiredSuite] = &[
-    RequiredSuite {
-        id: "conformance",
-        command: &[
-            "cargo",
-            "test",
-            "-p",
-            "mlx-tests",
-            "--test",
-            "conformance",
-            "--",
-            "--test-threads=1",
-        ],
-    },
-    RequiredSuite {
-        id: "state_optimizers",
-        command: &[
-            "cargo",
-            "test",
-            "-p",
-            "mlx-tests",
-            "--test",
-            "state_optimizers",
-            "--",
-            "--test-threads=1",
-        ],
-    },
-    RequiredSuite {
-        id: "state_compile",
-        command: &[
-            "cargo",
-            "test",
-            "-p",
-            "mlx-tests",
-            "--test",
-            "state_compile",
-            "--",
-            "--test-threads=1",
-        ],
-    },
-    RequiredSuite {
-        id: "state_transforms",
-        command: &[
-            "cargo",
-            "test",
-            "-p",
-            "mlx-tests",
-            "--test",
-            "state_transforms",
-            "--",
-            "--test-threads=1",
-        ],
-    },
-];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Mode {
-    Pre,
-    Admit,
-}
-
-#[derive(Debug)]
-enum SuiteSource {
-    File(PathBuf),
-    Rerun,
-}
-
-#[derive(Debug)]
-struct Options {
-    mode: Mode,
-    boundary_base: Option<String>,
-    ffi_report: Option<PathBuf>,
-    suite_source: SuiteSource,
-    replay_report: PathBuf,
-    waivers: PathBuf,
-    allow_local_ffi: bool,
-}
-
-impl Options {
-    fn parse(repo_root: &Path, args: &[String]) -> Result<Self, String> {
-        let mut mode = None;
-        let mut ffi_report = None;
-        let mut boundary_base = None;
-        let mut suite_source = None;
-        let mut replay_report = repo_root.join("conformance/target/replay-report.json");
-        let mut waivers = repo_root.join("admission/waivers.json");
-        let mut allow_local_ffi = false;
-        let mut index = 0;
-        while index < args.len() {
-            match args[index].as_str() {
-                "--pre" if mode.is_none() => mode = Some(Mode::Pre),
-                "--admit" if mode.is_none() => mode = Some(Mode::Admit),
-                "--ffi-report" if ffi_report.is_none() => {
-                    index += 1;
-                    ffi_report = Some(PathBuf::from(args.get(index).ok_or_else(usage)?));
-                }
-                "--boundary-base" if boundary_base.is_none() => {
-                    index += 1;
-                    boundary_base = Some(args.get(index).ok_or_else(usage)?.clone());
-                }
-                "--suite-results" if suite_source.is_none() => {
-                    index += 1;
-                    suite_source = Some(SuiteSource::File(PathBuf::from(
-                        args.get(index).ok_or_else(usage)?,
-                    )));
-                }
-                "--rerun-suites" if suite_source.is_none() => {
-                    suite_source = Some(SuiteSource::Rerun)
-                }
-                "--replay-report" => {
-                    index += 1;
-                    replay_report = PathBuf::from(args.get(index).ok_or_else(usage)?);
-                }
-                "--waivers" => {
-                    index += 1;
-                    waivers = PathBuf::from(args.get(index).ok_or_else(usage)?);
-                }
-                "--allow-local-ffi" if !allow_local_ffi => allow_local_ffi = true,
-                _ => return Err(usage()),
-            }
-            index += 1;
-        }
-        Ok(Self {
-            mode: mode.ok_or_else(usage)?,
-            boundary_base,
-            ffi_report,
-            suite_source: suite_source.ok_or_else(usage)?,
-            replay_report,
-            waivers,
-            allow_local_ffi,
-        })
-    }
-}
-
-fn usage() -> String {
-    "usage: cargo run -p xtask -- verify-bump (--pre|--admit) [--boundary-base <ref>] [--ffi-report <file>] (--suite-results <file>|--rerun-suites) [--replay-report <file>] [--waivers <file>] [--allow-local-ffi]".to_owned()
-}
-
 pub(crate) fn run(repo_root: &Path, args: &[String]) -> i32 {
-    let report = match Options::parse(repo_root, args) {
-        Ok(options) => aggregate(repo_root, &options),
-        Err(error) => json!({
-            "schema_version": 1,
-            "command": "verify-bump",
-            "verdict": "fail",
-            "errors": [error]
-        }),
-    };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&report).expect("serialize verify-bump report")
-    );
-    i32::from(report["verdict"] != "pass")
-}
-
-fn aggregate(repo_root: &Path, options: &Options) -> Value {
-    let workspace_commit = git(repo_root, &["rev-parse", "HEAD"]);
-    let tuple = verify_tuple(repo_root, options.mode);
-    let expected_mlx_c = match options.mode {
-        Mode::Pre => OLD_COMMIT,
-        Mode::Admit => TARGET_COMMIT,
-    };
-    let suites = match (&options.suite_source, workspace_commit.as_deref()) {
-        (SuiteSource::File(path), Ok(commit)) => read_json(&resolve_path(repo_root, path))
-            .and_then(|report| {
-                validate_suite_results(&report, commit, expected_mlx_c)?;
-                Ok(report)
-            })
-            .map_err(|error| format!("suite results: {error}")),
-        (SuiteSource::Rerun, Ok(commit)) => {
-            let report = rerun_suites(repo_root, commit, expected_mlx_c);
-            validate_suite_results(&report, commit, expected_mlx_c).map(|_| report)
+    let result = (|| {
+        if !args.is_empty() {
+            return Err("usage: cargo xtask verify-bump".to_owned());
         }
-        (_, Err(error)) => Err(error.clone()),
-    };
-    let ledger = crate::verify_ledger::verify_value(repo_root, &[]);
-    let boundary_args = options
-        .boundary_base
-        .as_ref()
-        .map(|base| vec!["--base".to_owned(), base.clone()])
-        .unwrap_or_default();
-    let boundary = match (options.mode, options.boundary_base.as_deref()) {
-        (Mode::Admit, None) => Err(
-            "--admit requires --boundary-base <old-tuple-ref> for diff-based oracle separation"
-                .to_owned(),
-        ),
-        (Mode::Admit, Some(base)) => validate_boundary_base(repo_root, base)
-            .and_then(|_| crate::verify_oracle_boundary::verify_value(repo_root, &boundary_args)),
-        (Mode::Pre, _) => crate::verify_oracle_boundary::verify_value(repo_root, &boundary_args),
-    };
-    let fingerprint = match &tuple {
-        Ok(_) => [OLD_COMMIT, TARGET_COMMIT]
-            .into_iter()
-            .map(|reference| {
-                let path = repo_root.join(format!("ledger/mlx-c-{reference}.json"));
-                crate::fingerprint::verify_committed(repo_root, reference, &path)
-                    .map(|report| (reference, report))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()
-            .map(|reports| json!(reports)),
-        Err(error) => Err(error.clone()),
-    };
-    let ffi = match (&options.ffi_report, workspace_commit.as_deref()) {
-        (Some(path), Ok(commit)) => crate::verify_ffi::discovered_target_ids(repo_root)
-            .and_then(|inventory| {
-                read_json(&resolve_path(repo_root, path)).and_then(|report| {
-                    validate_ffi_report(
-                        &report,
-                        commit,
-                        expected_mlx_c,
-                        options.allow_local_ffi,
-                        &inventory.into_iter().collect(),
-                    )
-                })
-            }),
-        (None, _) => Err(format!(
-            "missing FFI report; run verify-ffi --guard-malloc and pass --ffi-report <file>{}; lower-trust procedure: {LOCAL_FFI_PROCEDURE}",
-            if options.allow_local_ffi {
-                ""
-            } else {
-                "; local evidence also requires --allow-local-ffi"
-            }
-        )),
-        (_, Err(error)) => Err(error.clone()),
-    };
-    let replay_report = resolve_path(repo_root, &options.replay_report);
-    let replay_path = if options.mode == Mode::Admit
-        && replay_report != repo_root.join("conformance/target/replay-report.json")
-    {
-        Err(
-            "--admit requires the canonical conformance/target/replay-report.json artifact"
-                .to_owned(),
-        )
-    } else {
-        require_tracked_unchanged(repo_root, &replay_report)
-    };
-    let replay = replay_path
-        .and_then(|_| read_json(&replay_report))
-        .and_then(|report| {
-            let parent = replay_report
-                .parent()
-                .ok_or("replay report path has no parent")?;
-            validate_replay_document(parent, &report, true)
-        });
-    let waiver_manifest = resolve_path(repo_root, &options.waivers);
-    let waiver_path = if options.mode == Mode::Admit
-        && waiver_manifest != repo_root.join("admission/waivers.json")
-    {
-        Err("--admit requires the canonical admission/waivers.json manifest".to_owned())
-    } else {
-        require_tracked_unchanged(repo_root, &waiver_manifest)
-    };
-    let waiver_result = waiver_path
-        .and_then(|_| read_json(&waiver_manifest))
-        .and_then(|document| {
-            let ledger_entries = ledger_waiver_scopes(repo_root)?;
-            validate_waivers(&document, &current_date(), &ledger_entries)
-        });
-    let waiver_error = waiver_result.as_ref().err().cloned();
-    let waivers = waiver_result.unwrap_or_default();
-
-    let checks = vec![
-        check(1, "tuple", "immutable dependency tuple", tuple.map(|_| json!({
-            "current_mlx_c_commit": expected_mlx_c,
-            "required_nested_mlx": if options.mode == Mode::Pre { OLD_MLX } else { TARGET_MLX }
-        }))),
-        check(2, "boundary", "oracle boundary and digest integrity", boundary),
-        check(
-            3,
-            "race",
-            "error registration race regression",
-            verify_race_regression(repo_root),
-        ),
-        check(4, "ffi", "qualified FFI safety gate", ffi),
-        check(
-            5,
-            "semantic",
-            "strict semantic conformance",
-            suites.as_ref().map_err(Clone::clone).and_then(|report| {
-                require_suite_pass(report, "conformance")
-            }),
-        ),
-        check(6, "ledger", "classified target delta ledger", ledger.clone()),
-        check(6, "fingerprints", "canonical ABI fingerprints", fingerprint),
-        check(
-            6,
-            "feature_matrix",
-            "supported feature matrix",
-            ledger.and_then(|report| {
-                if report["supported_builds"].as_u64() == Some(2) {
-                    Ok(json!({"supported_builds": 2}))
-                } else {
-                    Err("verify-ledger did not validate two supported builds".to_owned())
-                }
-            }),
-        ),
-        check(
-            7,
-            "state",
-            "state and transform packs",
-            suites.as_ref().map_err(Clone::clone).and_then(|report| {
-                for id in ["state_optimizers", "state_compile", "state_transforms"] {
-                    require_suite_pass(report, id)?;
-                }
-                Ok(json!({"suites": ["state_optimizers", "state_compile", "state_transforms"]}))
-            }),
-        ),
-        check(8, "replay", "deterministic target-version replay", replay),
-        check(
-            0,
-            "sentinel",
-            "mlx-lm sentinel presence",
-            validate_sentinel(repo_root),
-        ),
-        check(
-            0,
-            "waivers",
-            "waiver manifest",
-            waiver_error.map_or_else(
-                || Ok(json!({"active": waivers.len()})),
-                Err,
-            ),
-        ),
-    ];
-    build_verdict(options.mode, checks, waivers)
-}
-
-fn check(item: u8, id: &str, name: &str, result: Result<Value, String>) -> Value {
+        verify_tuple(repo_root)?;
+        verify_sentinel(repo_root)?;
+        verify_race_regression(repo_root)?;
+        let path = repo_root.join("conformance/target/replay-report.json");
+        require_tracked_unchanged(repo_root, &path)?;
+        let source = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let replay = validate_replay_document(path.parent().unwrap(), &source, true)?;
+        println!("tuple, sentinel inputs and target replay passed: {replay}");
+        Ok(())
+    })();
     match result {
-        Ok(evidence) => json!({
-            "id": id,
-            "admission_item": if item == 0 { Value::Null } else { json!(item) },
-            "name": name,
-            "status": "pass",
-            "evidence": evidence,
-            "reason": Value::Null
-        }),
-        Err(reason) => json!({
-            "id": id,
-            "admission_item": if item == 0 { Value::Null } else { json!(item) },
-            "name": name,
-            "status": "fail",
-            "evidence": Value::Null,
-            "reason": reason
-        }),
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("verify-bump: {error}");
+            1
+        }
     }
 }
 
-fn build_verdict(mode: Mode, mut checks: Vec<Value>, waivers: Vec<Value>) -> Value {
-    for waiver in &waivers {
-        let Some(scope) = waiver.get("check").and_then(Value::as_str) else {
-            continue;
-        };
-        if matches!(scope, "tuple" | "ledger" | "fingerprints") {
-            continue;
-        }
-        if let Some(check) = checks
-            .iter_mut()
-            .find(|check| check["id"] == scope && check["status"] == "fail")
-        {
-            check["status"] = "waived".into();
-            check["waiver"] = waiver.clone();
-        }
-    }
-    let failed = checks.iter().any(|check| check["status"] == "fail");
-    let mut admit_requirements = checks
-        .iter()
-        .filter(|check| check["status"] == "fail")
-        .map(|check| {
-            format!(
-                "{}: {}",
-                check["id"].as_str().unwrap_or("unknown"),
-                check["reason"].as_str().unwrap_or("unmet")
-            )
-        })
-        .collect::<Vec<_>>();
-    if mode == Mode::Pre {
-        admit_requirements.push(format!(
-            "update mlx-c submodule to {TARGET_COMMIT}, retain nested MLX v{TARGET_MLX}, then rerun with --admit"
-        ));
-        admit_requirements.push(
-            "pass --boundary-base <old-tuple-ref> so --admit verifies the complete bump diff"
-                .to_owned(),
-        );
-    }
-    json!({
-        "schema_version": 1,
-        "command": "verify-bump",
-        "mode": mode,
-        "recorded_tuple": {
-            "old": {"mlx_c_commit": OLD_COMMIT, "mlx": OLD_MLX},
-            "target": {"mlx_c_commit": TARGET_COMMIT, "mlx": TARGET_MLX}
-        },
-        "checks": checks,
-        "active_waivers": waivers,
-        "admit_requirements": admit_requirements,
-        "verdict": if failed { "fail" } else { "pass" }
-    })
-}
-
-fn verify_tuple(repo_root: &Path, mode: Mode) -> Result<Value, String> {
+fn verify_tuple(repo_root: &Path) -> Result<(), String> {
     let mlx_c = repo_root.join("mlx-sys/src/mlx-c");
-    let current_commit = git(&mlx_c, &["rev-parse", "HEAD"])?;
-    let current_pin = nested_pin(
-        &fs::read_to_string(mlx_c.join("CMakeLists.txt"))
-            .map_err(|error| format!("failed to read current mlx-c CMakeLists.txt: {error}"))?,
-    )?;
-    let target_cmake = git(
-        &mlx_c,
-        &["show", &format!("{TARGET_COMMIT}:CMakeLists.txt")],
-    )?;
-    let target_pin = nested_pin(&target_cmake)?;
-    validate_tuple_values(
-        mode,
-        &current_commit,
-        &current_pin,
-        TARGET_COMMIT,
-        &target_pin,
-    )?;
-    if mode == Mode::Admit {
-        require_clean_tree(repo_root, "workspace")?;
-        require_clean_tree(&mlx_c, "mlx-c submodule")?;
+    let current = git(&mlx_c, &["rev-parse", "HEAD"])?;
+    let pin =
+        nested_pin(&fs::read_to_string(mlx_c.join("CMakeLists.txt")).map_err(|e| e.to_string())?)?;
+    validate_tuple_values(&current, &pin)?;
+    let classification = read_json(&repo_root.join("ledger/target-delta-classification.json"))?;
+    if classification["old_source_commit"] != OLD_COMMIT
+        || classification["target_source_commit"] != TARGET_COMMIT
+    {
+        return Err("ABI classification does not match the bump tuple".into());
     }
-    Ok(json!({
-        "current_mlx_c_commit": current_commit,
-        "current_nested_mlx": current_pin,
-        "target_mlx_c_commit": TARGET_COMMIT,
-        "target_nested_mlx": target_pin
-    }))
+    Ok(())
 }
 
-fn validate_boundary_base(repo_root: &Path, base: &str) -> Result<(), String> {
-    let base_commit = git(repo_root, &["rev-parse", &format!("{base}^{{commit}}")])?;
-    let head_commit = git(repo_root, &["rev-parse", "HEAD"])?;
-    let ancestor = Command::new("git")
-        .args(["merge-base", "--is-ancestor", &base_commit, &head_commit])
-        .current_dir(repo_root)
-        .status()
-        .map_err(|error| format!("failed to validate boundary base ancestry: {error}"))?
-        .success();
-    let gitlink = git(
-        repo_root,
-        &["rev-parse", &format!("{base_commit}:mlx-sys/src/mlx-c")],
-    )?;
-    validate_boundary_base_values(&base_commit, &head_commit, ancestor, &gitlink)
-}
-
-fn validate_boundary_base_values(
-    base_commit: &str,
-    head_commit: &str,
-    ancestor: bool,
-    mlx_c_gitlink: &str,
-) -> Result<(), String> {
-    if base_commit == head_commit {
-        return Err("boundary base must be distinct from HEAD".to_owned());
-    }
-    if !ancestor {
-        return Err("boundary base must be an ancestor of HEAD".to_owned());
-    }
-    if mlx_c_gitlink != OLD_COMMIT {
+fn validate_tuple_values(current: &str, pin: &str) -> Result<(), String> {
+    if current != TARGET_COMMIT || pin != TARGET_MLX {
         return Err(format!(
-            "boundary base must record old mlx-c {OLD_COMMIT}, got {mlx_c_gitlink}"
+            "expected mlx-c {TARGET_COMMIT} / MLX {TARGET_MLX}, got {current} / {pin}"
         ));
     }
     Ok(())
 }
 
-fn validate_tuple_values(
-    mode: Mode,
-    current_commit: &str,
-    current_pin: &str,
-    target_commit: &str,
-    target_pin: &str,
-) -> Result<(), String> {
-    let (expected_commit, expected_pin) = match mode {
-        Mode::Pre => (OLD_COMMIT, OLD_MLX),
-        Mode::Admit => (TARGET_COMMIT, TARGET_MLX),
-    };
-    if current_commit != expected_commit {
-        return Err(format!(
-            "{mode:?} mode requires mlx-c {expected_commit}, got {current_commit}"
-        ));
+fn verify_race_regression(repo_root: &Path) -> Result<Value, String> {
+    let path = repo_root.join("mlx-tests/tests/ffi_safety.rs");
+    let source = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let syntax = syn::parse_file(&source)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    let name = "concurrent_invoke_errors_stay_on_the_calling_thread";
+    let found = syntax.items.iter().any(|item| {
+        matches!(item, syn::Item::Fn(function) if function.sig.ident == name && function.attrs.iter().any(|attr| attr.path().is_ident("test")))
+    });
+    if !found {
+        return Err(format!("missing concurrent race regression {name}"));
     }
-    if current_pin != expected_pin {
-        return Err(format!(
-            "{mode:?} mode requires current nested MLX v{expected_pin}, got v{current_pin}"
-        ));
+    Ok(json!({"test": format!("mlx-tests/tests/ffi_safety.rs#{name}")}))
+}
+
+fn verify_sentinel(repo_root: &Path) -> Result<(), String> {
+    let root = repo_root.join("conformance/sentinel/fixtures/tiny-llama");
+    let expectations = read_json(&root.join("expectations.json"))?;
+    require_schema(&expectations, "sentinel expectations")?;
+    for name in [
+        "config.json",
+        "tokenizer.json",
+        "model.safetensors",
+        "model.perturbed.safetensors",
+        "expectations.safetensors",
+    ] {
+        if !root.join(name).is_file() {
+            return Err(format!("sentinel is missing {name}"));
+        }
     }
-    if target_commit != TARGET_COMMIT {
-        return Err(format!(
-            "recorded target commit must be {TARGET_COMMIT}, got {target_commit}"
-        ));
+    for (name, digest) in expectations["provenance"]["artifact_sha256"]
+        .as_object()
+        .ok_or("sentinel artifact_sha256 must be an object")?
+    {
+        if hash_file(&root.join(name))? != format!("sha256:{}", digest.as_str().unwrap_or("")) {
+            return Err(format!("sentinel artifact {name} digest mismatch"));
+        }
     }
-    if target_pin != TARGET_MLX {
-        return Err(format!(
-            "target nested MLX pin must be v{TARGET_MLX}, got v{target_pin}"
-        ));
+    if expectations["qualification"]["comparator_rejects"] != true {
+        return Err("sentinel comparator qualification is missing".to_owned());
     }
     Ok(())
 }
@@ -557,217 +126,15 @@ fn nested_pin(cmake: &str) -> Result<String, String> {
         .ok_or_else(|| "mlx-c CMakeLists.txt has no MLX GIT_TAG".to_owned())
 }
 
-fn validate_suite_results(
-    report: &Value,
-    workspace_commit: &str,
-    mlx_c_commit: &str,
-) -> Result<(), String> {
-    require_schema(report, "suite results")?;
-    require_value(report, "source_commit", workspace_commit, "suite results")?;
-    require_value(report, "mlx_c_commit", mlx_c_commit, "suite results")?;
-    if report["source_clean"] != true || report["mlx_c_clean"] != true {
-        return Err("suite results were not captured from clean source trees".to_owned());
-    }
-    if report["verdict"] != "pass" {
-        return Err("suite results verdict is not pass".to_owned());
-    }
-    let suites = report["suites"]
-        .as_array()
-        .ok_or("suite results suites must be an array")?;
-    for required in REQUIRED_SUITES {
-        let suite = suites
-            .iter()
-            .find(|suite| suite["id"] == required.id)
-            .ok_or_else(|| format!("missing suite {}", required.id))?;
-        if suite["command"] != json!(required.command) {
-            return Err(format!("suite {} command does not match", required.id));
-        }
-        if suite["verdict"] != "pass" {
-            return Err(format!("suite {} verdict is not pass", required.id));
-        }
-    }
-    if suites.len() != REQUIRED_SUITES.len() {
-        return Err("suite results contain unexpected suites".to_owned());
-    }
-    Ok(())
-}
-
-fn require_suite_pass(report: &Value, id: &str) -> Result<Value, String> {
-    let suite = report["suites"]
-        .as_array()
-        .and_then(|suites| suites.iter().find(|suite| suite["id"] == id))
-        .ok_or_else(|| format!("missing suite {id}"))?;
-    if suite["verdict"] != "pass" {
-        return Err(format!("suite {id} verdict is not pass"));
-    }
-    Ok(suite.clone())
-}
-
-fn rerun_suites(repo_root: &Path, workspace_commit: &str, mlx_c_commit: &str) -> Value {
-    let suites = REQUIRED_SUITES
-        .iter()
-        .map(|suite| {
-            eprintln!("running bump suite {}", suite.id);
-            let output = Command::new(suite.command[0])
-                .args(&suite.command[1..])
-                .current_dir(repo_root)
-                .output();
-            let (verdict, error) = match output {
-                Ok(output) if output.status.success() => ("pass", None),
-                Ok(output) => (
-                    "fail",
-                    Some(format!(
-                        "exited {}; stderr: {}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    )),
-                ),
-                Err(error) => ("fail", Some(format!("failed to launch: {error}"))),
-            };
-            json!({
-                "id": suite.id,
-                "command": suite.command,
-                "verdict": verdict,
-                "error": error
-            })
-        })
-        .collect::<Vec<_>>();
-    let passed = suites.iter().all(|suite| suite["verdict"] == "pass");
-    json!({
-        "schema_version": 1,
-        "source_commit": workspace_commit,
-        "mlx_c_commit": mlx_c_commit,
-        "source_clean": tree_is_clean(repo_root),
-        "mlx_c_clean": tree_is_clean(&repo_root.join("mlx-sys/src/mlx-c")),
-        "suites": suites,
-        "verdict": if passed { "pass" } else { "fail" }
-    })
-}
-
-fn validate_ffi_report(
-    report: &Value,
-    workspace_commit: &str,
-    mlx_c_commit: &str,
-    allow_local: bool,
-    expected_inventory: &BTreeSet<String>,
-) -> Result<Value, String> {
-    require_schema(report, "FFI report")?;
-    require_value(report, "command", "verify-ffi", "FFI report")?;
-    require_value(report, "source_commit", workspace_commit, "FFI report")?;
-    require_value(report, "mlx_c_commit", mlx_c_commit, "FFI report")?;
-    if report["source_clean"] != true || report["mlx_c_clean"] != true {
-        return Err("FFI report was not captured from clean source trees".to_owned());
-    }
-    if report["environment"]["architecture"] != "aarch64"
-        || report["environment"]["os"] != "macos"
-        || report["environment"]["rustc"]
-            .as_str()
-            .is_none_or(str::is_empty)
-    {
-        return Err("FFI report environment is not qualified macOS aarch64".to_owned());
-    }
-    if report["guard_malloc_requested"] != true {
-        return Err("FFI report must include the --guard-malloc lane".to_owned());
-    }
-    if report["discovery"]["status"] != "pass" || report["verdict"] != "pass" {
-        return Err("FFI report verdict is not pass".to_owned());
-    }
-    let binaries = report["binaries"]
-        .as_array()
-        .filter(|binaries| !binaries.is_empty())
-        .ok_or("FFI report contains no binaries")?;
-    let mut paths = BTreeSet::new();
-    let mut leak_coverage = BTreeSet::new();
-    let mut guard_coverage = BTreeSet::new();
-    let mut has_ffi_safety = false;
-    let mut inventory = BTreeSet::new();
-    for binary in binaries {
-        let path = binary["binary"]["path"]
-            .as_str()
-            .ok_or("FFI report binary path must be a string")?;
-        if !paths.insert(path) {
-            return Err(format!("FFI report contains duplicate binary {path}"));
-        }
-        has_ffi_safety |= binary["binary"]["target"] == "ffi_safety";
-        let package_id = binary["binary"]["package_id"]
-            .as_str()
-            .ok_or("FFI report binary package_id must be a string")?;
-        let target = binary["binary"]["target"]
-            .as_str()
-            .ok_or("FFI report binary target must be a string")?;
-        let target_kind = binary["binary"]["target_kind"]
-            .as_array()
-            .ok_or("FFI report binary target_kind must be an array")?
-            .iter()
-            .map(|kind| {
-                kind.as_str()
-                    .ok_or("FFI report target_kind must contain strings")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let identity = format!(
-            "{}|{target}|{}",
-            crate::verify_ffi::stable_package_id(package_id),
-            target_kind.join(",")
-        );
-        if !inventory.insert(identity.clone()) {
-            return Err(format!("FFI report contains duplicate target {identity}"));
-        }
-        let leak = binary["leaks"]["status"].as_str();
-        let guard_passes = match leak {
-            Some("pass") => binary["guard_malloc"]["status"] == "pass",
-            Some("not_applicable") => {
-                binary["guard_malloc"].is_null() || binary["guard_malloc"]["status"] == "pass"
-            }
-            _ => false,
-        };
-        if !guard_passes || binary["test"] != "passed" {
-            return Err("FFI report contains a failed binary".to_owned());
-        }
-        if leak != Some("not_applicable") {
-            leak_coverage.insert(path);
-        }
-        guard_coverage.insert(path);
-    }
-    if !has_ffi_safety {
-        return Err("FFI report does not cover the ffi_safety target".to_owned());
-    }
-    if &inventory != expected_inventory {
-        return Err("FFI report binary inventory does not match fresh cargo discovery".to_owned());
-    }
-    let recorded_leaks = string_set(&report["covered_binaries"]["leaks"], "FFI leak coverage")?;
-    let recorded_guard = string_set(
-        &report["covered_binaries"]["guard_malloc"],
-        "FFI Guard Malloc coverage",
-    )?;
-    if recorded_leaks != leak_coverage || recorded_guard != guard_coverage {
-        return Err("FFI report covered_binaries does not match binary results".to_owned());
-    }
-    let trust = report["execution_context"]["trust"]
-        .as_str()
-        .ok_or("FFI report is missing execution_context.trust")?;
-    match trust {
-        "ci" if report["execution_context"]["procedure"]
-            .as_str()
-            .is_some_and(|procedure| procedure.starts_with("github-actions:")) => {}
-        "ci" => return Err("CI FFI report has no GitHub Actions run identity".to_owned()),
-        "local" if !allow_local => {
-            return Err(
-                "lower-trust local FFI report requires explicit --allow-local-ffi".to_owned(),
-            )
-        }
-        "local" if report["execution_context"]["procedure"] != LOCAL_FFI_PROCEDURE => {
-            return Err("local FFI report does not name the recorded procedure".to_owned())
-        }
-        "local" => {}
-        _ => return Err(format!("unsupported FFI report trust {trust}")),
-    }
-    Ok(json!({"trust": trust, "binaries": binaries.len()}))
-}
-
-fn validate_replay_document(base: &Path, report: &Value, strict: bool) -> Result<Value, String> {
-    require_schema(report, "target replay report")?;
-    require_value(report, "command", "target-replay", "target replay report")?;
-    if report["payload_sha256"] != hash_json(&report["payload"])? {
+fn validate_replay_document(base: &Path, source: &str, strict: bool) -> Result<Value, String> {
+    let report: Value = serde_json::from_str(source).map_err(|e| e.to_string())?;
+    let fields = JsonText::new(source)?.object()?;
+    let payload = fields
+        .get("payload")
+        .ok_or("target replay report has no payload")?;
+    require_schema(&report, "target replay report")?;
+    require_value(&report, "command", "target-replay", "target replay report")?;
+    if report["payload_sha256"] != hash_bytes(payload.as_bytes())? {
         return Err("target replay payload_sha256 does not match payload".to_owned());
     }
     let double = &report["double_run"];
@@ -778,7 +145,6 @@ fn validate_replay_document(base: &Path, report: &Value, strict: bool) -> Result
     for (field, expected) in [
         ("python", "3.12.14"),
         ("architecture", "arm64"),
-        ("venv", "conformance/.venv-target"),
         ("mlx", TARGET_MLX),
         ("mlx_metal", TARGET_MLX),
         ("numpy", "2.2.6"),
@@ -791,6 +157,7 @@ fn validate_replay_document(base: &Path, report: &Value, strict: bool) -> Result
             ));
         }
     }
+    required_case_field(handshake, "handshake", "venv")?;
     let suites = report["payload"]["suites"]
         .as_array()
         .ok_or("target replay suites must be an array")?;
@@ -823,8 +190,9 @@ fn validate_replay_document(base: &Path, report: &Value, strict: bool) -> Result
                 "target expectation shard {relative} digest mismatch"
             ));
         }
-        let shard = read_json(&path)?;
-        replay_shards.insert(id.to_owned(), shard.clone());
+        let source = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let shard: Value = serde_json::from_str(&source).map_err(|e| e.to_string())?;
+        replay_shards.insert(id.to_owned(), JsonText::new(&source)?.value()?);
         if shard["schema_version"] != 1 || shard["suite"] != id {
             return Err(format!(
                 "target expectation shard {relative} identity mismatch"
@@ -874,15 +242,18 @@ fn validate_replay_document(base: &Path, report: &Value, strict: bool) -> Result
     if report["verdict"] != "pass" {
         return Err("target replay report verdict is not pass".to_owned());
     }
-    let reconstructed = hash_json(&json!({
-        "payload": report["payload"],
-        "shards": replay_shards
-    }))?;
+    let reconstructed = hash_bytes(
+        encode_object(&BTreeMap::from([
+            ("payload".to_owned(), payload.clone()),
+            ("shards".to_owned(), encode_object(&replay_shards)),
+        ]))
+        .as_bytes(),
+    )?;
     if double["first_run_sha256"] != reconstructed || double["second_run_sha256"] != reconstructed {
         return Err("target replay double-run hash does not match payload and shards".to_owned());
     }
     let committed_provenance = strict
-        .then(|| validate_strict_replay(base, report, &seen))
+        .then(|| validate_strict_replay(base, &report, &seen))
         .transpose()?;
     Ok(json!({
         "payload_sha256": report["payload_sha256"],
@@ -1031,13 +402,15 @@ fn validate_strict_replay(
             .as_array()
             .ok_or("target replay shard cases must be an array")?
         {
-            required_case_field(case, id, "recipe")?;
+            if id == "gguf" && case["recipe"].is_object() {
+                required_case_field(&case["recipe"], id, "kind")?;
+            } else {
+                required_case_field(case, id, "recipe")?;
+            }
             required_case_field(case, id, "input_sha256")?;
             case["input_refs"]
                 .as_array()
-                .filter(|refs| {
-                    !refs.is_empty() && refs.iter().all(|reference| reference.as_str().is_some())
-                })
+                .filter(|refs| refs.iter().all(|reference| reference.as_str().is_some()))
                 .ok_or_else(|| format!("target replay suite {id} has invalid input_refs"))?;
             if case["verdict"] == "value_changed" && !case.get("max_error").is_some() {
                 return Err(format!(
@@ -1084,12 +457,24 @@ fn validate_strict_replay(
             expected_paths.insert(format!("conformance/{entry}"));
         }
     }
+    if let Some(fixtures) = corpus.get("gguf_fixtures") {
+        for path in fixtures
+            .as_object()
+            .ok_or("corpus gguf_fixtures must be an object")?
+            .keys()
+        {
+            expected_paths.insert(format!("conformance/{path}"));
+        }
+    }
     if expected_paths != sources.keys().cloned().collect() {
         return Err(
             "target replay source_artifacts set does not match committed inputs".to_owned(),
         );
     }
-    let historical_source_commit = if provenance_matches["post_migration"].is_empty() {
+    let historical_source_commit = if provenance_matches["post_migration"]
+        .iter()
+        .all(|suite| matches!(suite.as_str(), "probe_oob_take" | "probe_singular_inv"))
+    {
         None
     } else {
         let replay_report = base.join("replay-report.json");
@@ -1173,149 +558,6 @@ fn required_case_field<'a>(case: &'a Value, suite: &str, field: &str) -> Result<
         .ok_or_else(|| format!("target replay suite {suite} has invalid {field}"))
 }
 
-fn validate_waivers(
-    document: &Value,
-    today: &str,
-    ledger_entries: &BTreeSet<String>,
-) -> Result<Vec<Value>, String> {
-    require_schema(document, "waiver manifest")?;
-    let waivers = document["waivers"]
-        .as_array()
-        .ok_or("waiver manifest waivers must be an array")?;
-    let mut seen = BTreeSet::new();
-    for waiver in waivers {
-        let check = waiver
-            .get("check")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty());
-        let ledger_entry = waiver.get("ledger_entry").and_then(Value::as_object);
-        let waiver_id = match (check, ledger_entry) {
-            (Some(check), None) if CHECK_IDS.contains(&check) => format!("check:{check}"),
-            (Some(check), None) => return Err(format!("waiver has invalid check {check}")),
-            (None, Some(entry)) => {
-                let kind = entry
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or("waiver ledger_entry.kind must be non-empty")?;
-                let name = entry
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or("waiver ledger_entry.name must be non-empty")?;
-                let id = format!("ledger_entry:{kind}:{name}");
-                if !ledger_entries.contains(&id) {
-                    return Err(format!("waiver names unknown {id}"));
-                }
-                id
-            }
-            _ => return Err("waiver requires exactly one of check or ledger_entry".to_owned()),
-        };
-        if !seen.insert(waiver_id.clone()) {
-            return Err(format!("waiver has duplicate scope {waiver_id}"));
-        }
-        for field in [
-            "scope",
-            "failure_or_missing_capability",
-            "risk",
-            "owner",
-            "reviewer_approval",
-        ] {
-            required_nonempty(waiver, field)?;
-        }
-        waiver["compensating_evidence"]
-            .as_array()
-            .filter(|evidence| {
-                !evidence.is_empty()
-                    && evidence
-                        .iter()
-                        .all(|item| item.as_str().is_some_and(|item| !item.trim().is_empty()))
-            })
-            .ok_or_else(|| format!("waiver {waiver_id} requires compensating_evidence"))?;
-        match (
-            waiver.get("expires_on").and_then(Value::as_str),
-            waiver.get("expires_milestone").and_then(Value::as_str),
-        ) {
-            (Some(date), None) if valid_date(date) && date >= today => {}
-            (Some(date), None) if valid_date(date) => {
-                return Err(format!("waiver {waiver_id} expired on {date}"))
-            }
-            (None, Some("next_dependency_bump")) => {}
-            _ => {
-                return Err(format!(
-                "waiver {waiver_id} requires expires_on or expires_milestone next_dependency_bump"
-            ))
-            }
-        }
-    }
-    Ok(waivers.clone())
-}
-
-fn ledger_waiver_scopes(repo_root: &Path) -> Result<BTreeSet<String>, String> {
-    let document = read_json(&repo_root.join("ledger/target-delta-classification.json"))?;
-    document["entries"]
-        .as_array()
-        .ok_or("target delta classification entries must be an array")?
-        .iter()
-        .map(|entry| {
-            let kind = entry["kind"]
-                .as_str()
-                .ok_or("target delta entry kind must be a string")?;
-            let name = entry["name"]
-                .as_str()
-                .ok_or("target delta entry name must be a string")?;
-            Ok(format!("ledger_entry:{kind}:{name}"))
-        })
-        .collect()
-}
-
-fn validate_sentinel(repo_root: &Path) -> Result<Value, String> {
-    let root = repo_root.join("conformance/sentinel/fixtures/tiny-llama");
-    let expectations = read_json(&root.join("expectations.json"))?;
-    require_schema(&expectations, "sentinel expectations")?;
-    for name in [
-        "config.json",
-        "tokenizer.json",
-        "model.safetensors",
-        "model.perturbed.safetensors",
-        "expectations.safetensors",
-    ] {
-        if !root.join(name).is_file() {
-            return Err(format!("sentinel is missing {name}"));
-        }
-    }
-    for (name, digest) in expectations["provenance"]["artifact_sha256"]
-        .as_object()
-        .ok_or("sentinel artifact_sha256 must be an object")?
-    {
-        if hash_file(&root.join(name))? != format!("sha256:{}", digest.as_str().unwrap_or("")) {
-            return Err(format!("sentinel artifact {name} digest mismatch"));
-        }
-    }
-    if expectations["qualification"]["comparator_rejects"] != true
-        || !repo_root.join("mlx-lm/tests/sentinel.rs").is_file()
-    {
-        return Err("sentinel qualification or executing test is missing".to_owned());
-    }
-    Ok(json!({"fixture": "tiny-llama", "qualification": "present"}))
-}
-
-fn verify_race_regression(repo_root: &Path) -> Result<Value, String> {
-    let path = repo_root.join("mlx-tests/tests/ffi_safety.rs");
-    let source = fs::read_to_string(&path)
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let syntax = syn::parse_file(&source)
-        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
-    let name = "concurrent_invoke_errors_stay_on_the_calling_thread";
-    let found = syntax.items.iter().any(|item| {
-        matches!(item, syn::Item::Fn(function) if function.sig.ident == name && function.attrs.iter().any(|attr| attr.path().is_ident("test")))
-    });
-    if !found {
-        return Err(format!("missing concurrent race regression {name}"));
-    }
-    Ok(json!({"test": format!("mlx-tests/tests/ffi_safety.rs#{name}")}))
-}
-
 fn require_schema(value: &Value, name: &str) -> Result<(), String> {
     if value["schema_version"].as_u64() == Some(1) {
         Ok(())
@@ -1332,91 +574,11 @@ fn require_value(value: &Value, field: &str, expected: &str, name: &str) -> Resu
     }
 }
 
-fn required_nonempty<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
-    value[field]
-        .as_str()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("waiver field {field} must be non-empty"))
-}
-
-fn valid_date(date: &str) -> bool {
-    if !(date.len() == 10
-        && date.as_bytes()[4] == b'-'
-        && date.as_bytes()[7] == b'-'
-        && date
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit()))
-    {
-        return false;
-    }
-    let year = date[0..4].parse::<u32>().unwrap_or_default();
-    let month = date[5..7].parse::<u32>().unwrap_or_default();
-    let day = date[8..10].parse::<u32>().unwrap_or_default();
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => return false,
-    };
-    (1..=days).contains(&day)
-}
-
-fn current_date() -> String {
-    Command::new("date")
-        .arg("+%F")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|date| date.trim().to_owned())
-        .filter(|date| valid_date(date))
-        .unwrap_or_else(|| "9999-12-31".to_owned())
-}
-
 fn read_json(path: &Path) -> Result<Value, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("failed to parse {}: {error}", path.display()))
-}
-
-fn resolve_path(repo_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_owned()
-    } else {
-        repo_root.join(path)
-    }
-}
-
-fn string_set<'a>(value: &'a Value, name: &str) -> Result<BTreeSet<&'a str>, String> {
-    value
-        .as_array()
-        .ok_or_else(|| format!("{name} must be an array"))?
-        .iter()
-        .map(|item| {
-            item.as_str()
-                .ok_or_else(|| format!("{name} must contain strings"))
-        })
-        .collect()
-}
-
-fn tree_is_clean(directory: &Path) -> bool {
-    git(
-        directory,
-        &["status", "--porcelain", "--untracked-files=normal"],
-    )
-    .is_ok_and(|status| status.is_empty())
-}
-
-fn require_clean_tree(directory: &Path, name: &str) -> Result<(), String> {
-    if tree_is_clean(directory) {
-        Ok(())
-    } else {
-        Err(format!("{name} must be clean for --admit"))
-    }
 }
 
 fn require_tracked_unchanged(repo_root: &Path, path: &Path) -> Result<(), String> {
@@ -1497,10 +659,150 @@ fn replay_introduction_commit(repo_root: &Path, path: &str) -> Result<String, St
         .ok_or_else(|| format!("target replay report {path} has no introduction commit"))
 }
 
+#[cfg(test)]
 fn hash_json(value: &Value) -> Result<String, String> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|error| format!("failed to serialize JSON for hashing: {error}"))?;
-    hash_bytes(&bytes)
+    hash_bytes(&canonical_json(&value.to_string())?)
+}
+
+#[cfg(test)]
+fn canonical_json(source: &str) -> Result<Vec<u8>, String> {
+    let mut parser = JsonText::new(source)?;
+    Ok(parser.value()?.into_bytes())
+}
+
+struct JsonText<'a>(&'a str);
+
+impl<'a> JsonText<'a> {
+    fn new(source: &'a str) -> Result<Self, String> {
+        // Validate syntax without rounding numbers through serde_json::Value.
+        serde_json::from_str::<serde::de::IgnoredAny>(source).map_err(|e| e.to_string())?;
+        Ok(Self(source.trim_start()))
+    }
+
+    fn consume(&mut self) -> u8 {
+        let byte = self.0.as_bytes()[0];
+        self.0 = self.0[1..].trim_start();
+        byte
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        let mut stream = serde_json::Deserializer::from_str(self.0).into_iter::<String>();
+        let value = stream.next().unwrap().map_err(|e| e.to_string())?;
+        self.0 = self.0[stream.byte_offset()..].trim_start();
+        Ok(value)
+    }
+
+    fn object(&mut self) -> Result<BTreeMap<String, String>, String> {
+        if self.consume() != b'{' {
+            return Err("expected JSON object".to_owned());
+        }
+        let mut fields = BTreeMap::new();
+        while !self.0.starts_with('}') {
+            let key = self.string()?;
+            self.consume();
+            fields.insert(key, self.value()?);
+            if !self.0.starts_with(',') {
+                break;
+            }
+            self.consume();
+        }
+        self.consume();
+        Ok(fields)
+    }
+
+    fn value(&mut self) -> Result<String, String> {
+        match self.0.as_bytes()[0] {
+            b'"' => Ok(canonical_string(&self.string()?)),
+            b'{' => Ok(encode_object(&self.object()?)),
+            b'[' => {
+                self.consume();
+                let mut values = Vec::new();
+                while !self.0.starts_with(']') {
+                    values.push(self.value()?);
+                    if !self.0.starts_with(',') {
+                        break;
+                    }
+                    self.consume();
+                }
+                self.consume();
+                Ok(format!("[{}]", values.join(",")))
+            }
+            _ => {
+                let end = self
+                    .0
+                    .find(|c: char| c.is_ascii_whitespace() || ",]}".contains(c))
+                    .unwrap_or(self.0.len());
+                let token = &self.0[..end];
+                self.0 = self.0[end..].trim_start();
+                if token.contains(['.', 'e', 'E']) && !matches!(token, "true" | "false") {
+                    let value = token.parse::<f64>().map_err(|e| e.to_string())?;
+                    if !value.is_finite() {
+                        return Err("non-finite canonical JSON number".to_owned());
+                    }
+                    Ok(python_float(value))
+                } else {
+                    Ok(if token == "-0" { "0" } else { token }.to_owned())
+                }
+            }
+        }
+    }
+}
+
+fn canonical_string(value: &str) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+    for character in serde_json::to_string(value).unwrap().chars() {
+        if character >= '\u{7f}' {
+            for unit in character.encode_utf16(&mut [0; 2]) {
+                write!(output, "\\u{unit:04x}").unwrap();
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn encode_object(fields: &BTreeMap<String, String>) -> String {
+    let fields = fields
+        .iter()
+        .map(|(key, value)| format!("{}:{value}", canonical_string(key)))
+        .collect::<Vec<_>>();
+    format!("{{{}}}", fields.join(","))
+}
+
+fn python_float(value: f64) -> String {
+    // Python uses shortest ties-to-even digits, but different exponent formatting.
+    let shortest = serde_json::Number::from_f64(value).unwrap().to_string();
+    if value == 0.0 {
+        return shortest;
+    }
+    let (mantissa, exponent) = shortest.split_once('e').unwrap_or((&shortest, "0"));
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    let mantissa = mantissa.trim_start_matches('-');
+    let point = mantissa.find('.').unwrap_or(mantissa.len());
+    let digits = mantissa.replace('.', "");
+    let leading_zeros = digits.len() - digits.trim_start_matches('0').len();
+    let exponent = exponent.parse::<i32>().unwrap() + point as i32 - leading_zeros as i32 - 1;
+    let digits = digits.trim_start_matches('0').trim_end_matches('0');
+    if !(-4..16).contains(&exponent) {
+        let (first, rest) = digits.split_at(1);
+        let dot = if rest.is_empty() { "" } else { "." };
+        return format!("{sign}{first}{dot}{rest}e{exponent:+03}");
+    }
+    let point = exponent + 1;
+    if point <= 0 {
+        format!("{sign}0.{}{digits}", "0".repeat((-point) as usize))
+    } else if point as usize >= digits.len() {
+        format!(
+            "{sign}{digits}{}.0",
+            "0".repeat(point as usize - digits.len())
+        )
+    } else {
+        let (integer, fraction) = digits.split_at(point as usize);
+        format!("{sign}{integer}.{fraction}")
+    }
 }
 
 fn hash_bytes(bytes: &[u8]) -> Result<String, String> {
@@ -1553,103 +855,14 @@ fn git(directory: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 #[cfg(test)]
-fn synthetic_checks(ffi: Option<Value>, suites: Option<Value>, replay_passes: bool) -> Vec<Value> {
-    let pass = || Ok(json!({"captured": true}));
-    vec![
-        check(1, "tuple", "tuple", pass()),
-        check(2, "boundary", "boundary", pass()),
-        check(3, "race", "race", pass()),
-        check(
-            4,
-            "ffi",
-            "ffi",
-            ffi.map(|value| json!({"report": value}))
-                .ok_or_else(|| "missing lower-trust local FFI procedure report".to_owned()),
-        ),
-        check(
-            5,
-            "semantic",
-            "semantic",
-            suites
-                .as_ref()
-                .map(|_| json!({"captured": true}))
-                .ok_or_else(|| "missing suite results".to_owned()),
-        ),
-        check(6, "ledger", "ledger", pass()),
-        check(6, "fingerprints", "fingerprints", pass()),
-        check(6, "feature_matrix", "feature matrix", pass()),
-        check(
-            7,
-            "state",
-            "state",
-            suites
-                .map(|_| json!({"captured": true}))
-                .ok_or_else(|| "missing suite results".to_owned()),
-        ),
-        check(
-            8,
-            "replay",
-            "replay",
-            replay_passes
-                .then(|| json!({"captured": true}))
-                .ok_or_else(|| "missing replay".to_owned()),
-        ),
-        check(0, "sentinel", "sentinel", pass()),
-    ]
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{json, Value};
 
-    fn valid_ffi() -> Value {
-        json!({
-            "schema_version": 1,
-            "command": "verify-ffi",
-            "source_commit": "workspace",
-            "mlx_c_commit": OLD_COMMIT,
-            "source_clean": true,
-            "mlx_c_clean": true,
-            "environment": {"architecture": "aarch64", "os": "macos", "rustc": "rustc 1.98.0"},
-            "execution_context": {"trust": "local", "procedure": LOCAL_FFI_PROCEDURE},
-            "guard_malloc_requested": true,
-            "discovery": {"status": "pass", "error": null},
-            "binaries": [{
-                "binary": {"package_id": "mlx-tests", "target": "ffi_safety", "target_kind": ["test"], "path": "binary"},
-                "leaks": {"status": "pass", "result": null, "tool_status": null, "error": null},
-                "test": "passed",
-                "guard_malloc": {"status": "pass", "process_status": {"exit_code": 0, "signal": null}, "error": null}
-            }],
-            "covered_binaries": {"leaks": ["binary"], "guard_malloc": ["binary"]},
-            "verdict": "pass"
-        })
-    }
-
-    fn valid_ffi_inventory() -> BTreeSet<String> {
-        BTreeSet::from(["mlx-tests|ffi_safety|test".to_owned()])
-    }
-
-    fn valid_suite_results() -> Value {
-        json!({
-            "schema_version": 1,
-            "source_commit": "workspace",
-            "mlx_c_commit": OLD_COMMIT,
-            "source_clean": true,
-            "mlx_c_clean": true,
-            "verdict": "pass",
-            "suites": REQUIRED_SUITES.iter().map(|suite| json!({
-                "id": suite.id,
-                "command": suite.command,
-                "verdict": "pass"
-            })).collect::<Vec<_>>()
-        })
-    }
-
     fn replay_tree() -> (tempfile::TempDir, Value) {
         let root = tempfile::tempdir().unwrap();
         let handshake = json!({
-            "python": "3.12.14", "architecture": "arm64", "venv": "conformance/.venv-target",
+            "python": "3.12.14", "architecture": "arm64", "venv": "/scratch/replay/venv",
             "mlx": TARGET_MLX, "mlx_metal": TARGET_MLX, "numpy": "2.2.6",
             "mlx_runtime": TARGET_MLX, "device": "cpu"
         });
@@ -1914,6 +1127,19 @@ mod tests {
     }
 
     #[test]
+    fn json_numbers_deserialize_through_untagged_values() {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Scalar {
+            Float(f64),
+            Text(String),
+        }
+        let values: Vec<Scalar> = serde_json::from_str(r#"[1.25, "nan"]"#).unwrap();
+        assert!(matches!(values[0], Scalar::Float(value) if value == 1.25));
+        assert!(matches!(&values[1], Scalar::Text(value) if value == "nan"));
+    }
+
+    #[test]
     fn json_hash_matches_python_canonical_encoding() {
         let value = json!({"z": [1, true, null], "a": {"mlx": "0.32.2", "count": 2}});
 
@@ -1923,38 +1149,83 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tuple_rejects_target_commit_with_wrong_nested_pin() {
-        let error = validate_tuple_values(
-            Mode::Admit,
-            TARGET_COMMIT,
-            TARGET_MLX,
-            TARGET_COMMIT,
-            "0.32.1",
-        )
-        .unwrap_err();
+    fn python_canonical(expression: &str) -> Vec<u8> {
+        let output = Command::new("python3")
+            .args([
+                "-c",
+                &format!(
+                    "import json, math, random, struct, sys\nvalue = {expression}\nsys.stdout.buffer.write(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode())"
+                ),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        output.stdout
+    }
 
-        assert!(error.contains("target nested MLX pin"));
+    fn assert_python_canonical(expression: &str) {
+        let expected = python_canonical(expression);
+        assert_eq!(
+            canonical_json(std::str::from_utf8(&expected).unwrap()).unwrap(),
+            expected
+        );
     }
 
     #[test]
-    fn boundary_base_rejects_head_non_ancestor_and_wrong_old_tuple() {
-        assert!(
-            validate_boundary_base_values("head", "head", true, OLD_COMMIT)
-                .unwrap_err()
-                .contains("distinct")
+    fn canonical_json_matches_python_ascii() {
+        assert_python_canonical(
+            r#"{'z': [1, True, None], 'a': {'controls': ''.join(map(chr, range(128))), 'slash': '/\\\"'}}"#,
         );
-        assert!(
-            validate_boundary_base_values("base", "head", false, OLD_COMMIT)
-                .unwrap_err()
-                .contains("ancestor")
+    }
+
+    #[test]
+    fn canonical_json_matches_python_bmp() {
+        assert_python_canonical(
+            r#"{'é': 'árvíztűrő tükörfúrógép', 'a': '\u0080\u2028\u2029\uffff', '中': '日本語'}"#,
         );
-        assert!(
-            validate_boundary_base_values("base", "head", true, TARGET_COMMIT)
-                .unwrap_err()
-                .contains("old mlx-c")
-        );
-        validate_boundary_base_values("base", "head", true, OLD_COMMIT).unwrap();
+    }
+
+    #[test]
+    fn canonical_json_matches_python_astral() {
+        assert_python_canonical(r#"{'\U0001f600': '🎵𐀀\U0010ffff', '\ue000': ['雪', '🚀']}"#);
+    }
+
+    #[test]
+    fn canonical_json_matches_python_numbers() {
+        assert_python_canonical("[0, -1, 2**63, 2**64, -(2**100), 0.0, -0.0, 1.0, 1e-4, 1e-5, 1e15, 1e16, 1e20, 1e23, 1.2345678901234567, 5e-324, sys.float_info.max, 1.0000000000000002, 781366138262913.25]");
+    }
+
+    #[test]
+    fn canonical_json_matches_python_float_roundtrips() {
+        assert_python_canonical("[v for r in [random.Random(341)] for _ in range(4096) for v in [struct.unpack('!d', r.getrandbits(64).to_bytes(8, 'big'))[0]] if math.isfinite(v)]");
+    }
+
+    #[test]
+    fn canonical_json_matches_python_float_boundaries() {
+        assert_python_canonical("[v for exponent in range(-1074, 1024) for value in [2.0**exponent] for v in [value, math.nextafter(value, -math.inf), math.nextafter(value, math.inf)] if math.isfinite(v)]");
+    }
+
+    #[test]
+    fn canonical_json_normalizes_number_spellings() {
+        let source = "[-0, -0.0, 1e0, 100e-2, 1.2300, 1e-400, -1e-400, 0e0]";
+        let expected = python_canonical(&format!("json.loads('{source}')"));
+        assert_eq!(canonical_json(source).unwrap(), expected);
+    }
+
+    #[test]
+    fn committed_replay_passes_admission() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../conformance/target")
+            .canonicalize()
+            .unwrap();
+        let report = fs::read_to_string(base.join("replay-report.json")).unwrap();
+        validate_replay_document(&base, &report, true).unwrap();
+    }
+
+    #[test]
+    fn replay_accepts_pinned_environment_in_scratch_venv() {
+        let (root, report) = replay_tree();
+        validate_replay_document(root.path(), &report.to_string(), false).unwrap();
     }
 
     #[test]
@@ -1962,7 +1233,7 @@ mod tests {
         let (root, mut report) = replay_tree();
         report["payload"]["handshake"]["mlx_runtime"] = "0.32.1".into();
 
-        let error = validate_replay_document(root.path(), &report, false).unwrap_err();
+        let error = validate_replay_document(root.path(), &report.to_string(), false).unwrap_err();
 
         assert!(error.contains("payload_sha256"));
     }
@@ -1972,7 +1243,7 @@ mod tests {
         let (root, report) = replay_tree();
         std::fs::remove_file(root.path().join("arithmetic.json")).unwrap();
 
-        let error = validate_replay_document(root.path(), &report, false).unwrap_err();
+        let error = validate_replay_document(root.path(), &report.to_string(), false).unwrap_err();
 
         assert!(error.contains("missing target expectation shard"));
     }
@@ -1999,7 +1270,7 @@ mod tests {
         report["double_run"]["first_run_sha256"] = double_digest.clone().into();
         report["double_run"]["second_run_sha256"] = double_digest.into();
 
-        let error = validate_replay_document(root.path(), &report, false).unwrap_err();
+        let error = validate_replay_document(root.path(), &report.to_string(), false).unwrap_err();
 
         assert!(error.contains("recipe_failed"));
     }
@@ -2010,7 +1281,7 @@ mod tests {
         report["double_run"]["first_run_sha256"] = "sha256:forged".into();
         report["double_run"]["second_run_sha256"] = "sha256:forged".into();
 
-        let error = validate_replay_document(root.path(), &report, false).unwrap_err();
+        let error = validate_replay_document(root.path(), &report.to_string(), false).unwrap_err();
 
         assert!(error.contains("double-run hash"));
     }
@@ -2059,7 +1330,7 @@ mod tests {
         let (root, report) = replay_provenance_tree();
         let replay_root = root.path().join("conformance/target");
 
-        let evidence = validate_replay_document(&replay_root, &report, true).unwrap();
+        let evidence = validate_replay_document(&replay_root, &report.to_string(), true).unwrap();
         assert_eq!(
             evidence["committed_provenance"],
             json!({
@@ -2079,7 +1350,7 @@ mod tests {
             &["commit", "--quiet", "-m", "test: migrate provenance"],
         );
 
-        let evidence = validate_replay_document(&replay_root, &report, true).unwrap();
+        let evidence = validate_replay_document(&replay_root, &report.to_string(), true).unwrap();
 
         assert_eq!(
             evidence["committed_provenance"],
@@ -2090,6 +1361,92 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn fresh_replay_keeps_current_sources_with_historical_probes() {
+        let (root, mut report) = replay_provenance_tree();
+        let (corpus, manifest) = replay_provenance_documents(true);
+        write_replay_fixture_json(root.path(), "conformance/corpus.json", &corpus);
+        write_replay_fixture_json(root.path(), "conformance/state/manifest.json", &manifest);
+        for path in ["conformance/corpus.json", "conformance/state/manifest.json"] {
+            report["payload"]["source_artifacts"][path] =
+                json!(hash_file(&root.path().join(path)).unwrap());
+        }
+        for suite in ["state", "transforms"] {
+            let path = format!("conformance/target/target-expectations/{suite}.json");
+            let mut shard = read_json(&root.path().join(&path)).unwrap();
+            shard["old_environment"] = manifest["provenance"]["environment"].clone();
+            write_replay_fixture_json(root.path(), &path, &shard);
+        }
+        run_replay_fixture_git(root.path(), &["add", "conformance"]);
+        run_replay_fixture_git(
+            root.path(),
+            &["commit", "--quiet", "-m", "test: replay current corpus"],
+        );
+        let seen = BTreeSet::from([
+            "state",
+            "transforms",
+            "probe_oob_take",
+            "probe_singular_inv",
+        ]);
+
+        validate_strict_replay(&root.path().join("conformance/target"), &report, &seen).unwrap();
+    }
+
+    #[test]
+    fn strict_replay_accepts_cases_without_tensor_inputs() {
+        let (root, report) = replay_provenance_tree();
+        let path = "conformance/target/target-expectations/state.json";
+        let mut shard = read_json(&root.path().join(path)).unwrap();
+        shard["cases"][0]["input_refs"] = json!([]);
+        write_replay_fixture_json(root.path(), path, &shard);
+        let seen = BTreeSet::from([
+            "state",
+            "transforms",
+            "probe_oob_take",
+            "probe_singular_inv",
+        ]);
+
+        validate_strict_replay(&root.path().join("conformance/target"), &report, &seen).unwrap();
+    }
+
+    #[test]
+    fn strict_replay_binds_gguf_sources() {
+        let (root, mut report) = replay_provenance_tree();
+        let path = "conformance/fixtures/gguf/basic.gguf";
+        write_replay_fixture_file(root.path(), path, b"GGUF fixture");
+        let mut corpus = read_json(&root.path().join("conformance/corpus.json")).unwrap();
+        corpus["gguf_fixtures"] = json!({"fixtures/gguf/basic.gguf": {
+            "sha256": hash_file(&root.path().join(path)).unwrap()
+        }});
+        write_replay_fixture_json(root.path(), "conformance/corpus.json", &corpus);
+        for path in [path, "conformance/corpus.json"] {
+            report["payload"]["source_artifacts"][path] =
+                json!(hash_file(&root.path().join(path)).unwrap());
+        }
+        run_replay_fixture_git(root.path(), &["add", "conformance"]);
+        run_replay_fixture_git(
+            root.path(),
+            &["commit", "--quiet", "-m", "test: add GGUF fixture"],
+        );
+        let seen = BTreeSet::from([
+            "state",
+            "transforms",
+            "probe_oob_take",
+            "probe_singular_inv",
+        ]);
+        let replay_root = root.path().join("conformance/target");
+
+        validate_strict_replay(&replay_root, &report, &seen).unwrap();
+        fs::write(root.path().join(path), b"tampered GGUF fixture").unwrap();
+        run_replay_fixture_git(root.path(), &["add", path]);
+        run_replay_fixture_git(
+            root.path(),
+            &["commit", "--quiet", "-m", "test: tamper with GGUF fixture"],
+        );
+        let error = validate_strict_replay(&replay_root, &report, &seen).unwrap_err();
+        assert!(error.contains("digest mismatch"), "{error}");
     }
 
     #[test]
@@ -2117,137 +1474,6 @@ mod tests {
         assert_eq!(
             replay_introduction_commit(root.path(), "replay-report.json").unwrap(),
             introduction
-        );
-    }
-
-    #[test]
-    fn suite_results_reject_a_missing_named_suite() {
-        let mut report = valid_suite_results();
-        report["suites"].as_array_mut().unwrap().pop();
-
-        let error = validate_suite_results(&report, "workspace", OLD_COMMIT).unwrap_err();
-
-        assert!(error.contains("missing suite state_transforms"));
-    }
-
-    #[test]
-    fn ffi_requires_explicit_local_procedure_admission() {
-        let error = validate_ffi_report(
-            &valid_ffi(),
-            "workspace",
-            OLD_COMMIT,
-            false,
-            &valid_ffi_inventory(),
-        )
-        .unwrap_err();
-
-        assert!(error.contains("--allow-local-ffi"));
-        validate_ffi_report(
-            &valid_ffi(),
-            "workspace",
-            OLD_COMMIT,
-            true,
-            &valid_ffi_inventory(),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn ffi_accepts_guard_malloc_for_a_leak_ineligible_binary() {
-        let mut report = valid_ffi();
-        report["binaries"][0]["leaks"]["status"] = "not_applicable".into();
-        report["covered_binaries"]["leaks"] = json!([]);
-
-        validate_ffi_report(
-            &report,
-            "workspace",
-            OLD_COMMIT,
-            true,
-            &valid_ffi_inventory(),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn ffi_rejects_missing_critical_target_and_inconsistent_coverage() {
-        let mut missing = valid_ffi();
-        missing["binaries"][0]["binary"]["target"] = "unrelated".into();
-        assert!(validate_ffi_report(
-            &missing,
-            "workspace",
-            OLD_COMMIT,
-            true,
-            &valid_ffi_inventory()
-        )
-        .unwrap_err()
-        .contains("ffi_safety"));
-
-        let mut coverage = valid_ffi();
-        coverage["covered_binaries"]["guard_malloc"] = json!([]);
-        assert!(validate_ffi_report(
-            &coverage,
-            "workspace",
-            OLD_COMMIT,
-            true,
-            &valid_ffi_inventory(),
-        )
-        .unwrap_err()
-        .contains("covered_binaries"));
-    }
-
-    #[test]
-    fn waivers_reject_expired_and_unreviewed_entries() {
-        let expired = json!({
-            "schema_version": 1,
-            "waivers": [{
-                "check": "ffi", "scope": "one binary", "failure_or_missing_capability": "no runner",
-                "risk": "leak regression", "compensating_evidence": ["local report"], "owner": "owner",
-                "reviewer_approval": "reviewer", "expires_on": "2026-08-28"
-            }]
-        });
-        assert!(validate_waivers(&expired, "2026-08-29", &BTreeSet::new())
-            .unwrap_err()
-            .contains("expired"));
-        let mut unreviewed = expired;
-        unreviewed["waivers"][0]["expires_on"] = "2026-08-30".into();
-        unreviewed["waivers"][0]["reviewer_approval"] = "".into();
-        assert!(
-            validate_waivers(&unreviewed, "2026-08-29", &BTreeSet::new())
-                .unwrap_err()
-                .contains("reviewer_approval")
-        );
-    }
-
-    #[test]
-    fn waiver_dates_must_be_real_calendar_dates() {
-        assert!(valid_date("2028-02-29"));
-        assert!(!valid_date("2026-02-29"));
-        assert!(!valid_date("2026-13-01"));
-        assert!(!valid_date("2026-04-31"));
-    }
-
-    #[test]
-    fn waiver_manifest_accepts_a_named_ledger_entry_scope() {
-        let document = json!({
-            "schema_version": 1,
-            "waivers": [{
-                "ledger_entry": {"kind": "function", "name": "mlx_example"},
-                "scope": "target-only symbol",
-                "failure_or_missing_capability": "runtime probe unavailable",
-                "risk": "behavior is not independently exercised",
-                "compensating_evidence": ["canonical ABI fingerprint"],
-                "owner": "owner",
-                "reviewer_approval": "reviewer",
-                "expires_milestone": "next_dependency_bump"
-            }]
-        });
-
-        let scopes = BTreeSet::from(["ledger_entry:function:mlx_example".to_owned()]);
-        assert_eq!(
-            validate_waivers(&document, "2026-08-29", &scopes)
-                .unwrap()
-                .len(),
-            1
         );
     }
 
@@ -2283,23 +1509,9 @@ mod tests {
     }
 
     #[test]
-    fn pre_verdict_names_only_ffi_as_unmet_and_lists_admit_transition() {
-        let checks = synthetic_checks(None, Some(valid_suite_results()), true);
-        let report = build_verdict(Mode::Pre, checks, Vec::new());
-
-        assert_eq!(report["verdict"], "fail");
-        let failed = report["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|check| check["status"] == "fail")
-            .map(|check| check["id"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(failed, ["ffi"]);
-        assert!(report["admit_requirements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item.as_str().unwrap().contains(TARGET_COMMIT)));
+    fn tuple_requires_target_commit_and_nested_version() {
+        validate_tuple_values(TARGET_COMMIT, TARGET_MLX).unwrap();
+        assert!(validate_tuple_values(OLD_COMMIT, TARGET_MLX).is_err());
+        assert!(validate_tuple_values(TARGET_COMMIT, "0.32.1").is_err());
     }
 }

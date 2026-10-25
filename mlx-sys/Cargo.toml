@@ -1,6 +1,6 @@
 [package]
 name = "mlx-sys"
-version = "0.6.0" # Follows the pinned mlx-c release (v0.6.0-7-gc74db53, MLX 0.32.2).
+version = "0.6.0"
 authors.workspace = true
 edition.workspace = true
 
@@ -10,6 +10,8 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 readme = "README.md"
+# Exposes build-script metadata to dependents as DEP_MLX_* (see README.md).
+links = "mlx"
 
 [package.metadata.docs.rs]
 targets = [
@@ -23,6 +25,7 @@ default = ["accelerate", "metal"]
 
 accelerate = []
 metal = []
+metal-jit = ["metal"]
 
 [dependencies]
 

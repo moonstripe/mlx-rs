@@ -1,6 +1,4 @@
 [workspace.package]
-# All but mlx-sys should follow the same version. mlx-sys should follow
-# the version of mlx-c.
 version = "0.32.0"
 edition = "2021"
 authors = [
@@ -24,17 +22,17 @@ members = [
     "mlx-lm",
     "mlx-lm-cli",
     "mlx-tests",
-    "xtask",
 ]
 
+exclude = ["xtask"]
 resolver = "2"
 
 [workspace.dependencies]
 # workspace local dependencies
-mlx-sys = { version = "=0.6.0", path = "mlx-sys" }
+mlx-sys = { version = "=0.6.0", path = "mlx-sys", default-features = false }
 mlx-macros = { version = "0.32", path = "mlx-macros" }
 mlx-internal-macros = { version = "0.32", path = "mlx-internal-macros" }
-mlx-rs = { version = "0.32", path = "mlx-rs" }
+mlx-rs = { version = "0.32", path = "mlx-rs", default-features = false }
 mlx-lm = { version = "0.32", path = "mlx-lm" }
 
 # external dependencies
