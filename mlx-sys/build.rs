@@ -1,11 +1,10 @@
 extern crate cmake;
 
 use cmake::Config;
-#[cfg(feature = "metal")]
-use std::process::Command;
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 #[path = "src/bindgen_config.rs"]
