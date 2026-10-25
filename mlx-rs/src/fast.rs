@@ -398,16 +398,18 @@ pub struct MetalKernelApplyOptions {
     /// Fill every output with this value before the kernel runs. When absent, outputs start
     /// uninitialized and the kernel must write every element.
     pub init_value: Option<f32>,
-    /// Print the generated Metal source when the kernel is built.
+    /// Print the generated Metal source on every call to `apply`.
     pub verbose: bool,
 }
 
 /// A custom Metal kernel, compiled from source on first use and cached by MLX.
 ///
 /// The kernel body is written against the names given at construction: each input `a` is a
-/// `const device T* a` (plus `a_shape`, `a_strides` and `a_ndim` when the source mentions them),
-/// each output is a `device T*`, and Metal attributes such as `thread_position_in_grid` are
-/// declared automatically when referenced.
+/// `const device T* a`, or `const constant T* a` when it has fewer than eight elements.
+/// Non-scalar inputs also expose `a_shape`, `a_strides` and `a_ndim` when referenced in the
+/// source. A 0-d input is a `const constant T& a` and has no shape, strides or ndim arguments.
+/// Each output is a `device T*` (or an atomic pointer with `atomic_outputs`), and Metal
+/// attributes such as `thread_position_in_grid` are declared automatically when referenced.
 ///
 /// Kernels only run on the GPU. [`MetalKernel::apply`] uses the stream selected by
 /// [`crate::with_stream`] or [`crate::with_device`], falling back to the GPU outside a scope,
@@ -425,13 +427,15 @@ pub struct MetalKernelApplyOptions {
 /// )?;
 /// let a = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
 /// // SAFETY: Four threads read four f32 inputs and initialize distinct f32 outputs.
-/// let out = unsafe { kernel.apply(
-///     &[&a],
-///     &[MetalKernelOutput { shape: vec![4], dtype: Dtype::Float32 }],
-///     (4, 1, 1),
-///     (4, 1, 1),
-///     MetalKernelApplyOptions::default(),
-/// ) }?;
+/// let out = unsafe {
+///     kernel.apply(
+///         &[&a],
+///         &[MetalKernelOutput { shape: vec![4], dtype: Dtype::Float32 }],
+///         (4, 1, 1),
+///         (4, 1, 1),
+///         MetalKernelApplyOptions::default(),
+///     )?
+/// };
 /// assert_eq!(out[0].as_slice::<f32>(), &[2.0, 4.0, 6.0, 8.0]);
 /// # Ok::<(), mlx_rs::error::Exception>(())
 /// ```
@@ -444,8 +448,8 @@ pub struct MetalKernel {
 impl MetalKernel {
     /// Builds a kernel from its name, input and output names, and Metal body `source`.
     ///
-    /// At least one output name is required. Compilation is deferred to the first
-    /// [`apply`](Self::apply), so source errors surface there.
+    /// At least one output name is required. Compilation is deferred until the outputs are
+    /// evaluated, so source errors surface from [`Array::eval`], not [`apply`](Self::apply).
     pub fn new(
         name: &str,
         input_names: &[&str],
@@ -484,7 +488,8 @@ impl MetalKernel {
     ///
     /// `inputs` and `outputs` must match the counts given at construction. Like other
     /// operations the result is lazy; the kernel compiles and runs when the outputs are
-    /// evaluated.
+    /// evaluated. Source and threadgroup errors surface from [`Array::eval`]. The kernel and
+    /// option values may be dropped before evaluating the outputs.
     ///
     /// # Safety
     ///
@@ -882,7 +887,6 @@ mod tests {
         })
         .unwrap();
 
-        // Python MLX 0.32: same kernel through `mx.fast.metal_kernel`.
         assert_eq!(
             outputs[0].to_vec_exact::<f32>().unwrap(),
             [0.5, 1.25, 2.0, 2.75, 3.5, 4.25, 5.0, 5.75]
@@ -1045,5 +1049,61 @@ mod tests {
             .unwrap();
             assert_eq!(outputs[0].to_vec_exact::<f32>().unwrap(), expected);
         }
+    }
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_kernel_errors_are_deferred() {
+        for (name, source, size, group) in [
+            ("bad_source", "out[0] = a[0] +;", 1, 1),
+            (
+                "bad_group",
+                "uint i = thread_position_in_grid.x; out[i] = a[i];",
+                4096,
+                4096,
+            ),
+        ] {
+            let kernel =
+                MetalKernel::new(name, &["a"], &["out"], source, Default::default()).unwrap();
+            let input = Array::from_slice(&vec![1.0_f32; size as usize], &[size]);
+            // SAFETY: Invalid source cannot execute; the copy case has one f32 per grid thread.
+            let outputs = unsafe {
+                kernel.apply(
+                    &[&input],
+                    &[MetalKernelOutput {
+                        shape: vec![size],
+                        dtype: Dtype::Float32,
+                    }],
+                    (size, 1, 1),
+                    (group, 1, 1),
+                    Default::default(),
+                )
+            }
+            .expect("source and threadgroup errors are deferred");
+            assert!(outputs[0].eval().is_err());
+        }
+        let kernel = MetalKernel::new(
+            "after_error",
+            &["a"],
+            &["out"],
+            "out[0] = a;",
+            Default::default(),
+        )
+        .unwrap();
+        let input = Array::from_f32(2.0);
+        // SAFETY: One thread reads a scalar and initializes the single f32 output.
+        let outputs = unsafe {
+            kernel.apply(
+                &[&input],
+                &[MetalKernelOutput {
+                    shape: vec![1],
+                    dtype: Dtype::Float32,
+                }],
+                (1, 1, 1),
+                (1, 1, 1),
+                Default::default(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outputs[0].to_vec_exact::<f32>().unwrap(), [2.0]);
     }
 }

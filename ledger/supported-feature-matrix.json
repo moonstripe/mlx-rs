@@ -139,14 +139,21 @@
       },
       "evidence": {
         "api": "mlx-rs/src/fast.rs",
-        "test": "mlx-rs/src/fast.rs#test_metal_kernel_template_args_and_shapes (inline expected values)",
+        "test": "mlx-rs/src/fast.rs#test_metal_kernel_template_args_and_shapes (inline expected values from elementwise scale, bias and shape arithmetic; not conformance oracle evidence)",
         "leaks": "mlx-tests/tests/ffi_safety.rs",
-        "guard_malloc": "mlx-tests/tests/ffi_safety.rs"
+        "guard_malloc": "mlx-tests/tests/ffi_safety.rs",
+        "stream": "mlx-rs/src/fast.rs#test_metal_kernel_gpu_fallback_and_scopes",
+        "layout": "mlx-rs/src/fast.rs#test_metal_kernel_layout_copies_are_opt_in",
+        "deferred_errors": "mlx-rs/src/fast.rs#test_metal_kernel_errors_are_deferred",
+        "thread": "mlx-tests/tests/ffi_safety.rs: MetalKernel is not Clone, Send or Sync",
+        "safety": "mlx-rs/src/fast.rs#MetalKernel::apply: caller proves memory safety throughout deferred execution"
       },
       "api_feature_sets": [
         "default",
         "safetensors"
-      ]
+      ],
+      "python_path": "mlx.core.fast.metal_kernel",
+      "ownership": "MetalKernel owns one kernel handle; configuration, string-vector and destruction symbols are internal RAII support for this capability."
     }
   ],
   "builds": [

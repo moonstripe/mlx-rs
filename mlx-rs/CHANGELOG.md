@@ -6,7 +6,9 @@ Added
 
 - `fast::MetalKernel`: build and run custom Metal kernels from source (the Rust
   counterpart of `mx.fast.metal_kernel`), with `TemplateArg`, `MetalKernelOptions`,
-  `MetalKernelOutput` and `MetalKernelApplyOptions`.
+  `MetalKernelOutput` and `MetalKernelApplyOptions`. Requires the `metal` feature;
+  `apply` is unsafe, defaults to the GPU outside execution scopes, and leaves input
+  layouts unchanged unless `ensure_row_contiguous` is enabled.
 
 ## 0.32.0
 
