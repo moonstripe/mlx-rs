@@ -355,7 +355,7 @@ pub enum TemplateArg {
 }
 
 /// Construction options for [`MetalKernel::new`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg(feature = "metal")]
 pub struct MetalKernelOptions {
     /// Metal source placed before the generated kernel, such as helper functions or includes.
@@ -366,17 +366,6 @@ pub struct MetalKernelOptions {
     pub ensure_row_contiguous: bool,
     /// Declare outputs as `device atomic<T>*` so the kernel can use Metal atomics on them.
     pub atomic_outputs: bool,
-}
-
-#[cfg(feature = "metal")]
-impl Default for MetalKernelOptions {
-    fn default() -> Self {
-        Self {
-            header: String::new(),
-            ensure_row_contiguous: false,
-            atomic_outputs: false,
-        }
-    }
 }
 
 /// The shape and dtype of one [`MetalKernel`] output.
@@ -971,6 +960,7 @@ mod tests {
         .expect_err("custom Metal kernels only run on the GPU");
         assert!(error.what().contains("[metal_kernel]"));
     }
+
     #[cfg(feature = "metal")]
     #[test]
     fn test_metal_kernel_gpu_fallback_and_scopes() {
@@ -1050,6 +1040,7 @@ mod tests {
             assert_eq!(outputs[0].to_vec_exact::<f32>().unwrap(), expected);
         }
     }
+
     #[cfg(feature = "metal")]
     #[test]
     fn test_metal_kernel_errors_are_deferred() {
