@@ -360,8 +360,9 @@ pub enum TemplateArg {
 pub struct MetalKernelOptions {
     /// Metal source placed before the generated kernel, such as helper functions or includes.
     pub header: String,
-    /// Copy inputs to row-contiguous layout before the kernel runs. Disable only when the source
-    /// indexes inputs through their `_strides` (for example with `elem_to_loc`).
+    /// Copy inputs to row-contiguous layout only when `true`. Defaults to `false`; Python
+    /// defaults to `true`. When `false`, the source must handle the inputs' actual layout
+    /// (for example through `_strides` and `elem_to_loc`).
     pub ensure_row_contiguous: bool,
     /// Declare outputs as `device atomic<T>*` so the kernel can use Metal atomics on them.
     pub atomic_outputs: bool,
@@ -372,7 +373,7 @@ impl Default for MetalKernelOptions {
     fn default() -> Self {
         Self {
             header: String::new(),
-            ensure_row_contiguous: true,
+            ensure_row_contiguous: false,
             atomic_outputs: false,
         }
     }
@@ -408,9 +409,9 @@ pub struct MetalKernelApplyOptions {
 /// each output is a `device T*`, and Metal attributes such as `thread_position_in_grid` are
 /// declared automatically when referenced.
 ///
-/// Kernels only run on the GPU. [`MetalKernel::apply`] uses the ambient stream (see
-/// [`crate::with_stream`]) and fails if that stream is not on the GPU or MLX was built without
-/// Metal.
+/// Kernels only run on the GPU. [`MetalKernel::apply`] uses the stream selected by
+/// [`crate::with_stream`] or [`crate::with_device`], falling back to the GPU outside a scope,
+/// even when the default device is the CPU. Selecting a CPU scope returns an error.
 ///
 /// ```rust
 /// use mlx_rs::{fast::{MetalKernel, MetalKernelApplyOptions, MetalKernelOptions, MetalKernelOutput}, Array, Dtype};
@@ -575,7 +576,7 @@ impl MetalKernel {
         )?;
 
         let inputs = crate::utils::VectorArray::try_from_iter(inputs.iter())?;
-        let stream = Stream::thread_local_or_default();
+        let stream = Stream::thread_local_or_gpu();
         Vec::<Array>::try_from_op(|res| unsafe {
             mlx_sys::mlx_fast_metal_kernel_apply(
                 res,
@@ -965,5 +966,84 @@ mod tests {
         })
         .expect_err("custom Metal kernels only run on the GPU");
         assert!(error.what().contains("[metal_kernel]"));
+    }
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_kernel_gpu_fallback_and_scopes() {
+        let kernel = MetalKernel::new(
+            "stream_copy",
+            &["a"],
+            &["out"],
+            "out[0] = a[0];",
+            Default::default(),
+        )
+        .unwrap();
+        let a = Array::from_slice(&[3.0_f32], &[1]);
+        let output = [MetalKernelOutput {
+            shape: vec![1],
+            dtype: Dtype::Float32,
+        }];
+        let apply = || {
+            // SAFETY: One thread copies one f32 between single-element buffers.
+            unsafe { kernel.apply(&[&a], &output, (1, 1, 1), (1, 1, 1), Default::default()) }
+        };
+        assert_eq!(apply().unwrap()[0].to_vec_exact::<f32>().unwrap(), [3.0]);
+        let previous = crate::Device::default();
+        crate::Device::set_default(&crate::Device::cpu());
+        let fallback = apply();
+        let gpu_scope = crate::with_device(crate::Device::gpu(), apply);
+        let cpu_scope = crate::with_device(crate::Device::cpu(), apply);
+        let gpu_stream = crate::with_stream(&Stream::gpu(), apply);
+        let cpu_stream = crate::with_stream(&Stream::cpu(), apply);
+        crate::Device::set_default(&previous);
+        for outputs in [fallback, gpu_scope, gpu_stream] {
+            assert_eq!(outputs.unwrap()[0].to_vec_exact::<f32>().unwrap(), [3.0]);
+        }
+        assert!(cpu_scope.is_err());
+        assert!(cpu_stream.is_err());
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_kernel_layout_copies_are_opt_in() {
+        let a = Array::from_slice(&[0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0], &[2, 3]);
+        let transposed = a.transpose().unwrap();
+        for (options, expected) in [
+            (
+                MetalKernelOptions::default(),
+                [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            ),
+            (
+                MetalKernelOptions {
+                    ensure_row_contiguous: true,
+                    ..Default::default()
+                },
+                [0.0, 3.0, 1.0, 4.0, 2.0, 5.0],
+            ),
+        ] {
+            let kernel = MetalKernel::new(
+                "physical_copy",
+                &["a"],
+                &["out"],
+                "uint i = thread_position_in_grid.x; out[i] = a[i];",
+                options,
+            )
+            .unwrap();
+            // SAFETY: Six threads copy distinct f32 elements within both six-element buffers.
+            let outputs = unsafe {
+                kernel.apply(
+                    &[&transposed],
+                    &[MetalKernelOutput {
+                        shape: vec![6],
+                        dtype: Dtype::Float32,
+                    }],
+                    (6, 1, 1),
+                    (6, 1, 1),
+                    Default::default(),
+                )
+            }
+            .unwrap();
+            assert_eq!(outputs[0].to_vec_exact::<f32>().unwrap(), expected);
+        }
     }
 }
