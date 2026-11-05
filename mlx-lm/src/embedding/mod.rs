@@ -1,8 +1,9 @@
-//! EmbeddingGemma 2 text embeddings.
+//! EmbeddingGemma 2 text and image embeddings.
 
 mod config;
 #[cfg(test)]
 mod tests;
+mod vision;
 
 use crate::{
     config::ParameterPath,
@@ -12,18 +13,51 @@ use crate::{
 use config::{EncoderConfig, LayerShape};
 use mlx_rs::{fast, nn, ops, utils::StateProjection, Array, Dtype};
 use std::{marker::PhantomData, path::Path, rc::Rc};
+use vision::VisionTower;
 
 /// External prefix of the text encoder's tensors in MLX-layout checkpoints.
 const TEXT_PREFIX: &str = "language_model.";
-/// Media towers this text-only embedder leaves unloaded.
-const MEDIA_PREFIXES: [&str; 4] = [
-    "vision_tower.",
-    "embed_vision.",
-    "audio_tower.",
-    "embed_audio.",
-];
+/// Audio tensors this embedder leaves unloaded.
+const AUDIO_PREFIXES: [&str; 2] = ["audio_tower.", "embed_audio."];
 
-/// A loaded EmbeddingGemma 2 text encoder and its tokenizer.
+/// An RGB image already resized for the vision tower: `height * width * 3` bytes,
+/// row-major, channels interleaved.
+///
+/// The embedder does not resize. Both sides must be positive multiples of
+/// `patch_size * pooling_kernel_size` (48 for the published checkpoints), and
+/// `(height / 48) * (width / 48)` must not exceed the soft-token budget (280), as
+/// produced by the published processor's aspect-preserving bicubic resize.
+#[derive(Debug, Clone, Copy)]
+pub struct RgbImage<'a> {
+    pixels: &'a [u8],
+    height: usize,
+    width: usize,
+}
+
+impl<'a> RgbImage<'a> {
+    /// Wraps interleaved RGB bytes, returning `None` unless
+    /// `pixels.len() == height * width * 3`.
+    pub fn new(pixels: &'a [u8], height: usize, width: usize) -> Option<Self> {
+        let expected = height.checked_mul(width)?.checked_mul(3)?;
+        (pixels.len() == expected).then_some(Self {
+            pixels,
+            height,
+            width,
+        })
+    }
+
+    /// Height in pixels.
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Width in pixels.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+}
+
+/// A loaded EmbeddingGemma 2 encoder, its optional vision tower and its tokenizer.
 ///
 /// [`Embedder::embed`] tokenizes each text with the tokenizer's post-processor
 /// (`<bos>` and `<eos>` for the published checkpoints), right-pads the batch with
@@ -32,15 +66,22 @@ const MEDIA_PREFIXES: [&str; 4] = [
 /// Prompts such as `task: search result | query: ` from the checkpoint's
 /// `config_sentence_transformers.json` are part of the caller's text.
 ///
-/// Only the text encoder is loaded. Vision and audio tensors in the checkpoint are
-/// ignored, and texts that tokenize to media placeholder tokens are rejected.
-/// The encoder's weights must be floating point; quantized checkpoints are rejected.
+/// [`Embedder::embed_images`] encodes each image with the vision tower and places
+/// its soft tokens in `<bos> <boi> <image> * n <eoi> <eos>`, which the same encoder
+/// pools into the shared embedding space.
+///
+/// The vision tower loads when `config.json` declares `vision_config`. Audio
+/// tensors in the checkpoint are ignored, and texts that tokenize to media
+/// placeholder tokens are rejected. Weights must be floating point; quantized
+/// checkpoints are rejected.
 ///
 /// `Embedder` is `!Send` and `!Sync`: create, use and drop it on one OS thread inside
 /// the chosen device or stream scope.
 pub struct Embedder {
     encoder: Encoder,
     tokenizer: Tokenizer,
+    /// `<bos>` and `<eos>` as the tokenizer's post-processor adds them.
+    specials: (Vec<TokenId>, Vec<TokenId>),
     _thread_bound: PhantomData<Rc<()>>,
 }
 
@@ -49,8 +90,10 @@ impl Embedder {
     /// from a local EmbeddingGemma 2 checkpoint directory.
     ///
     /// Every `language_model.*` tensor must fill exactly one encoder parameter with
-    /// the expected shape. `vision_tower.*`, `embed_vision.*`, `audio_tower.*` and
-    /// `embed_audio.*` tensors are ignored; any other tensor is an error.
+    /// the expected shape, and so must every `vision_tower.*` and `embed_vision.*`
+    /// tensor when the configuration declares a vision tower (they are ignored
+    /// otherwise). `audio_tower.*` and `embed_audio.*` tensors are ignored; any
+    /// other tensor is an error.
     pub fn from_dir(path: impl AsRef<Path>) -> Result<Self, LoadError> {
         let path = path.as_ref();
         let config_path = path.join("config.json");
@@ -66,12 +109,20 @@ impl Embedder {
             crate::TokenizerError::MissingFile(missing) => LoadError::MissingFile(missing),
             other => LoadError::Tokenizer(other),
         })?;
+        let specials = match config.vision.as_ref().map(|vision| vision.boi_token_id) {
+            Some(marker) => special_frame(&tokenizer, marker)?,
+            None => (Vec::new(), Vec::new()),
+        };
         let manifest = WeightManifest::discover(path)?;
+        let with_vision = config.vision.is_some();
         let mut encoder = Encoder::new(config, &manifest)?;
-        manifest.load_with(&mut encoder.weight_projection()?, map_key)?;
+        manifest.load_with(&mut encoder.weight_projection()?, |key| {
+            map_key(key, with_vision)
+        })?;
         Ok(Self {
             encoder,
             tokenizer,
+            specials,
             _thread_bound: PhantomData,
         })
     }
@@ -122,30 +173,137 @@ impl Embedder {
             }
             encoded.push(ids);
         }
-        let embeddings = self.encoder.embed(&encoded)?;
+        let embeddings = self.encoder.embed(&encoded, None)?;
+        embeddings.eval()?;
+        Ok(embeddings)
+    }
+
+    /// Embeds a batch of images into an evaluated `f32` array of shape
+    /// `[images.len(), dimension()]` whose rows have unit L2 norm, in the same
+    /// space as [`Embedder::embed`].
+    ///
+    /// Each image yields `(height / s) * (width / s)` soft tokens, where
+    /// `s = patch_size * pooling_kernel_size`; see [`RgbImage`] for the size rules.
+    pub fn embed_images(&self, images: &[RgbImage<'_>]) -> Result<Array, EmbeddingError> {
+        let vision = self
+            .encoder
+            .vision
+            .as_ref()
+            .ok_or(EmbeddingError::NoVisionTower)?;
+        if images.is_empty() {
+            return Err(EmbeddingError::EmptyBatch);
+        }
+        let c = &vision.config;
+        let side = c.patch_size * c.pooling_kernel_size;
+        let (bos, eos) = &self.specials;
+        let mut sequences = Vec::with_capacity(images.len());
+        let mut grids = Vec::with_capacity(images.len());
+        for (input, image) in images.iter().enumerate() {
+            let (height, width) = (image.height, image.width);
+            let tokens = (height / side) * (width / side);
+            if height == 0
+                || width == 0
+                || height % side != 0
+                || width % side != 0
+                || tokens > c.max_soft_tokens
+                || (width / c.patch_size).max(height / c.patch_size) > c.position_embedding_size
+            {
+                return Err(EmbeddingError::ImageSize {
+                    input,
+                    height,
+                    width,
+                });
+            }
+            let length = bos.len() + tokens + 2 + eos.len();
+            if length > self.encoder.config.max_positions {
+                return Err(EmbeddingError::SequenceTooLong {
+                    input,
+                    length,
+                    limit: self.encoder.config.max_positions,
+                });
+            }
+            let mut ids = bos.clone();
+            ids.push(TokenId::from(c.boi_token_id));
+            ids.extend(std::iter::repeat_n(TokenId::from(c.image_token_id), tokens));
+            ids.push(TokenId::from(c.eoi_token_id));
+            ids.extend(eos);
+            sequences.push(ids);
+            grids.push((height / c.patch_size, width / c.patch_size));
+        }
+        let features = images
+            .iter()
+            .zip(&grids)
+            .map(|(image, &(rows, columns))| vision.features(image.pixels, rows, columns))
+            .collect::<Result<Vec<_>, _>>()?;
+        let features = ops::concatenate(&features, 0)?;
+        let embeddings = self
+            .encoder
+            .embed(&sequences, Some((c.image_token_id, &features)))?;
         embeddings.eval()?;
         Ok(embeddings)
     }
 }
 
-fn map_key(external: &str) -> WeightDisposition {
+/// Tokens the post-processor places before and after a text, found by encoding a
+/// media marker's own content with special tokens, as the published processor
+/// encodes `<boi> <image> * n <eoi>`.
+fn special_frame(
+    tokenizer: &Tokenizer,
+    marker: u32,
+) -> Result<(Vec<TokenId>, Vec<TokenId>), LoadError> {
+    let content = tokenizer.decode(&[TokenId::from(marker)])?;
+    let ids = tokenizer.encode_with_special_tokens(&content, true)?;
+    let positions: Vec<usize> = ids
+        .iter()
+        .enumerate()
+        .filter(|(_, &id)| u32::from(id) == marker)
+        .map(|(index, _)| index)
+        .collect();
+    let [at] = positions[..] else {
+        return Err(LoadError::TokenizerMetadataMismatch {
+            key: format!("encoding of media token {marker}"),
+            expected: "the token once".into(),
+            actual: format!("{ids:?}"),
+        });
+    };
+    Ok((ids[..at].to_vec(), ids[at + 1..].to_vec()))
+}
+
+fn map_key(external: &str, with_vision: bool) -> WeightDisposition {
     if let Some(internal) = external.strip_prefix(TEXT_PREFIX) {
         WeightDisposition::Parameter(ParameterPath::new(internal))
-    } else if MEDIA_PREFIXES
+    } else if vision::PREFIXES
+        .iter()
+        .any(|prefix| external.starts_with(prefix))
+    {
+        if with_vision {
+            WeightDisposition::Parameter(ParameterPath::new(external))
+        } else {
+            WeightDisposition::Ignore {
+                reason: "the configuration declares no vision tower",
+            }
+        }
+    } else if AUDIO_PREFIXES
         .iter()
         .any(|prefix| external.starts_with(prefix))
     {
         WeightDisposition::Ignore {
-            reason: "media towers are not loaded by the text embedder",
+            reason: "the audio tower is not loaded by the embedder",
         }
     } else {
         WeightDisposition::Reject
     }
 }
 
-/// Allocates a placeholder with the checkpoint's floating dtype and the expected shape.
+/// Allocates a text-encoder placeholder; see [`slot_key`].
 fn slot(manifest: &WeightManifest, internal: &str, shape: &[usize]) -> Result<Array, WeightError> {
-    let key = format!("{TEXT_PREFIX}{internal}");
+    slot_key(manifest, &format!("{TEXT_PREFIX}{internal}"), shape)
+}
+
+/// Allocates a placeholder with the checkpoint's floating dtype and the expected
+/// shape for the external tensor `key`.
+fn slot_key(manifest: &WeightManifest, key: &str, shape: &[usize]) -> Result<Array, WeightError> {
+    let key = key.to_owned();
     let entry = manifest
         .tensors
         .get(&key)
@@ -345,6 +503,7 @@ struct Encoder {
     /// Distinct RoPE tables and each layer's index into them.
     rope_keys: Vec<RopeKey>,
     layer_rope: Vec<usize>,
+    vision: Option<VisionTower>,
 }
 
 impl Encoder {
@@ -371,6 +530,11 @@ impl Encoder {
                 });
             layer_rope.push(position);
         }
+        let vision = config
+            .vision
+            .clone()
+            .map(|vision| VisionTower::new(vision, hidden, manifest))
+            .transpose()?;
         Ok(Self {
             embed_tokens: slot(
                 manifest,
@@ -396,6 +560,7 @@ impl Encoder {
             layers,
             rope_keys,
             layer_rope,
+            vision,
             config,
         })
     }
@@ -419,11 +584,21 @@ impl Encoder {
             "embedding_projection.weight",
             &mut self.embedding_projection,
         )?;
+        if let Some(vision) = &mut self.vision {
+            vision.project(&mut projection)?;
+        }
         Ok(projection)
     }
 
     /// Pools and normalizes a nonempty batch of in-vocabulary token sequences.
-    fn embed(&self, batch: &[Vec<TokenId>]) -> Result<Array, mlx_rs::error::Exception> {
+    ///
+    /// With `media`, the rows of its `[count, hidden]` features replace, in order,
+    /// the embeddings of every position whose token equals its placeholder id.
+    fn embed(
+        &self,
+        batch: &[Vec<TokenId>],
+        media: Option<(u32, &Array)>,
+    ) -> Result<Array, mlx_rs::error::Exception> {
         let length = batch.iter().map(Vec::len).max().unwrap_or(0);
         let mut ids = Vec::with_capacity(batch.len() * length);
         let mut valid = Vec::with_capacity(batch.len() * length);
@@ -438,9 +613,9 @@ impl Encoder {
         }
         // Lengths are bounded by max_position_embeddings, which fits i32.
         let shape = [batch.len() as i32, length as i32];
-        let ids = Array::from_slice(&ids, &shape);
+        let x = self.token_embeddings(&ids, &shape, media)?;
         let valid = Array::from_slice(&valid, &shape);
-        let hidden = self.forward(&ids, &valid)?;
+        let hidden = self.forward(x, &valid)?;
         // Mean pooling promotes the projected states to f32 through the mask.
         let mask = valid.expand_dims(-1)?;
         let summed = hidden.multiply(&mask)?.sum_axis(1, false)?;
@@ -450,15 +625,50 @@ impl Encoder {
         pooled.divide(ops::maximum(norm, Array::from_f32(1e-9))?)
     }
 
-    /// Projected token states `[batch, length, embedding_dim]` for padded ids and a
-    /// `{0, 1}` validity mask of the same shape.
-    fn forward(&self, ids: &Array, valid: &Array) -> Result<Array, mlx_rs::error::Exception> {
+    /// Scaled token embeddings `[batch, length, hidden]`, with placeholder
+    /// positions looked up as the pad token and then replaced by media features.
+    fn token_embeddings(
+        &self,
+        ids: &[i32],
+        shape: &[i32; 2],
+        media: Option<(u32, &Array)>,
+    ) -> Result<Array, mlx_rs::error::Exception> {
+        let placeholder = media.map(|(id, _)| id as i32);
+        let pad = self.config.pad_token_id as i32;
+        let mut lookup = Vec::with_capacity(ids.len());
+        let mut source = Vec::with_capacity(ids.len());
+        let mut is_media = Vec::with_capacity(ids.len());
+        let mut next = 0i32;
+        for &id in ids {
+            let media = Some(id) == placeholder;
+            lookup.push(if media { pad } else { id });
+            source.push(if media { next } else { 0 });
+            next += i32::from(media);
+            is_media.push(media);
+        }
+        let x = self
+            .embed_tokens
+            .take_axis(Array::from_slice(&lookup, shape), 0)?;
+        let dtype = x.dtype();
+        let x = x.multiply(scalar((self.config.hidden_size as f64).sqrt(), dtype)?)?;
+        let Some((_, features)) = media else {
+            return Ok(x);
+        };
+        let aligned = features
+            .take_axis(Array::from_slice(&source, &[ids.len() as i32]), 0)?
+            .reshape(&[shape[0], shape[1], -1])?
+            .as_dtype(dtype)?;
+        let mask = Array::from_slice(&is_media, shape).expand_dims(-1)?;
+        ops::select(&mask, &aligned, &x)
+    }
+
+    /// Projected token states `[batch, length, embedding_dim]` for scaled input
+    /// embeddings and a `{0, 1}` validity mask `[batch, length]`.
+    fn forward(&self, mut x: Array, valid: &Array) -> Result<Array, mlx_rs::error::Exception> {
         let config = &self.config;
         let eps = config.rms_norm_eps;
-        let (batch, length) = (ids.shape()[0], ids.shape()[1]);
-        let mut x = self.embed_tokens.take_axis(ids, 0)?;
+        let (batch, length) = (x.shape()[0], x.shape()[1]);
         let dtype = x.dtype();
-        x = x.multiply(scalar((config.hidden_size as f64).sqrt(), dtype)?)?;
 
         let per_layer = linear(&x, &self.per_layer_model_projection)?
             .multiply(scalar((config.hidden_size as f64).powf(-0.5), dtype)?)?

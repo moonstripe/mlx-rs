@@ -192,7 +192,7 @@ pub use config::{
     AffineQuantization, AttentionKind, Config, LayerQuantization, ModelType, ParameterPath,
     QuantizationConfig, RopeConfig, RopeScaling, TransformerDimensions,
 };
-pub use embedding::Embedder;
+pub use embedding::{Embedder, RgbImage};
 pub use error::{
     CacheError, ChatTemplateError, ConfigError, EmbeddingError, GenerationError, HubError,
     InferenceError, LoadError, SamplingError, TokenizerError, WeightError,

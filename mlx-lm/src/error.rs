@@ -384,14 +384,28 @@ pub enum EmbeddingError {
         /// Rows in the embedding table.
         vocabulary_size: usize,
     },
-    /// A text contains an image, audio or video placeholder token, which requires
-    /// media features this text embedder does not compute.
+    /// A text contains an image, audio or video placeholder token; media
+    /// features come only from the media entry points.
     #[error("input {input} contains media placeholder token {token_id:?}")]
     MediaToken {
         /// Zero-based index in the supplied batch.
         input: usize,
         /// Placeholder token identifier.
         token_id: crate::TokenId,
+    },
+    /// The checkpoint configuration declares no vision tower.
+    #[error("the checkpoint has no vision tower")]
+    NoVisionTower,
+    /// An image's sides are not positive multiples of `patch_size *
+    /// pooling_kernel_size`, or it yields more soft tokens than the tower admits.
+    #[error("image {input} of {height}x{width} pixels is not a valid vision-tower size")]
+    ImageSize {
+        /// Zero-based index in the supplied batch.
+        input: usize,
+        /// Height in pixels.
+        height: usize,
+        /// Width in pixels.
+        width: usize,
     },
     /// Preserves the source diagnostic.
     #[error(transparent)]

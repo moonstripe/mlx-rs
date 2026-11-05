@@ -19,6 +19,29 @@ pub(super) struct EncoderConfig {
     pub(super) pad_token_id: u32,
     pub(super) media_tokens: Vec<u32>,
     pub(super) layers: Vec<LayerShape>,
+    /// Present when the checkpoint declares a vision tower.
+    pub(super) vision: Option<VisionConfig>,
+}
+
+/// Validated Gemma 4 vision-tower facts and the image placeholder tokens.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct VisionConfig {
+    pub(super) hidden_size: usize,
+    pub(super) intermediate_size: usize,
+    pub(super) layers: usize,
+    pub(super) heads: usize,
+    pub(super) kv_heads: usize,
+    pub(super) head_dim: usize,
+    pub(super) patch_size: usize,
+    pub(super) pooling_kernel_size: usize,
+    pub(super) position_embedding_size: usize,
+    /// Upper bound on soft tokens per image (`default_output_length`).
+    pub(super) max_soft_tokens: usize,
+    pub(super) rms_norm_eps: f32,
+    pub(super) rope_theta: f32,
+    pub(super) image_token_id: u32,
+    pub(super) boi_token_id: u32,
+    pub(super) eoi_token_id: u32,
 }
 
 /// One encoder layer's attention geometry after `per_layer_config` overrides.
@@ -37,6 +60,39 @@ struct RawConfig {
     image_token_id: Option<u32>,
     audio_token_id: Option<u32>,
     video_token_id: Option<u32>,
+    boi_token_id: Option<u32>,
+    eoi_token_id: Option<u32>,
+    vision_config: Option<RawVision>,
+}
+
+#[derive(Deserialize)]
+struct RawVision {
+    model_type: String,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    global_head_dim: Option<usize>,
+    patch_size: usize,
+    pooling_kernel_size: usize,
+    position_embedding_size: usize,
+    default_output_length: usize,
+    rms_norm_eps: f64,
+    hidden_activation: String,
+    attention_bias: bool,
+    #[serde(default)]
+    use_clipped_linears: bool,
+    #[serde(default)]
+    standardize: bool,
+    rope_parameters: RawAxialRope,
+}
+
+#[derive(Deserialize)]
+struct RawAxialRope {
+    rope_theta: f64,
+    rope_type: String,
 }
 
 #[derive(Deserialize)]
@@ -239,10 +295,37 @@ pub(super) fn parse(bytes: &[u8]) -> Result<EncoderConfig, ConfigError> {
             rope_theta,
         });
     }
-    let media_tokens = [raw.image_token_id, raw.audio_token_id, raw.video_token_id]
+    let media_tokens: Vec<u32> = [raw.image_token_id, raw.audio_token_id, raw.video_token_id]
         .into_iter()
         .flatten()
         .collect();
+    if let Some(&token) = media_tokens
+        .iter()
+        .chain(&raw.boi_token_id)
+        .chain(&raw.eoi_token_id)
+        .find(|&&id| id as usize >= vocabulary_size)
+    {
+        return Err(invalid(
+            "media token ids",
+            format!("{token} is outside the vocabulary"),
+        ));
+    }
+    let vision = raw
+        .vision_config
+        .map(|vision| {
+            let token = |field: &str, id: Option<u32>| {
+                id.ok_or_else(|| ConfigError::MissingField {
+                    field: field.into(),
+                })
+            };
+            parse_vision(
+                vision,
+                token("image_token_id", raw.image_token_id)?,
+                token("boi_token_id", raw.boi_token_id)?,
+                token("eoi_token_id", raw.eoi_token_id)?,
+            )
+        })
+        .transpose()?;
     Ok(EncoderConfig {
         vocabulary_size,
         hidden_size,
@@ -255,5 +338,102 @@ pub(super) fn parse(bytes: &[u8]) -> Result<EncoderConfig, ConfigError> {
         pad_token_id: text.pad_token_id,
         media_tokens,
         layers,
+        vision,
+    })
+}
+
+fn parse_vision(
+    raw: RawVision,
+    image_token_id: u32,
+    boi_token_id: u32,
+    eoi_token_id: u32,
+) -> Result<VisionConfig, ConfigError> {
+    let unsupported = |what: String| {
+        Err(ConfigError::UnsupportedArchitecture(format!(
+            "{MODEL_TYPE} vision tower with {what}"
+        )))
+    };
+    if raw.model_type != "gemma4_vision" {
+        return unsupported(format!("model_type {}", raw.model_type));
+    }
+    if raw.hidden_activation != "gelu_pytorch_tanh" {
+        return unsupported(format!("hidden_activation {}", raw.hidden_activation));
+    }
+    if raw.attention_bias {
+        return unsupported("attention_bias".into());
+    }
+    // Neither checkpoint form carries clip bounds or standardization tensors.
+    if raw.use_clipped_linears {
+        return unsupported("use_clipped_linears".into());
+    }
+    if raw.standardize {
+        return unsupported("standardize".into());
+    }
+    if raw.rope_parameters.rope_type != "axial" {
+        return Err(ConfigError::UnsupportedRope(format!(
+            "vision_config: {}",
+            raw.rope_parameters.rope_type
+        )));
+    }
+    let field = |name: &str| format!("vision_config.{name}");
+    let hidden_size = positive(&field("hidden_size"), raw.hidden_size)?;
+    let heads = positive(&field("num_attention_heads"), raw.num_attention_heads)?;
+    let kv_heads = positive(&field("num_key_value_heads"), raw.num_key_value_heads)?;
+    let head_dim = positive(&field("head_dim"), raw.head_dim)?;
+    if raw.global_head_dim.is_some_and(|global| global != head_dim) {
+        return unsupported("global_head_dim different from head_dim".into());
+    }
+    if heads % kv_heads != 0 {
+        return Err(invalid(
+            field("num_key_value_heads"),
+            "must divide num_attention_heads",
+        ));
+    }
+    // Axial RoPE rotates one even half of the head per image axis.
+    if head_dim % 4 != 0 {
+        return Err(invalid(
+            field("head_dim"),
+            "axial RoPE needs a multiple of 4",
+        ));
+    }
+    let patch_size = positive(&field("patch_size"), raw.patch_size)?;
+    let pooling_kernel_size = positive(&field("pooling_kernel_size"), raw.pooling_kernel_size)?;
+    let patch_width = 3 * patch_size * patch_size;
+    if i32::try_from(patch_width).is_err() {
+        return Err(invalid(field("patch_size"), "patch width exceeds i32"));
+    }
+    let rms_norm_eps = raw.rms_norm_eps as f32;
+    if !rms_norm_eps.is_finite() || rms_norm_eps <= 0.0 {
+        return Err(invalid(
+            field("rms_norm_eps"),
+            "must be finite and positive",
+        ));
+    }
+    let rope_theta = raw.rope_parameters.rope_theta as f32;
+    if !rope_theta.is_finite() || rope_theta <= 0.0 {
+        return Err(invalid(
+            field("rope_parameters.rope_theta"),
+            "must be finite and positive",
+        ));
+    }
+    Ok(VisionConfig {
+        hidden_size,
+        intermediate_size: positive(&field("intermediate_size"), raw.intermediate_size)?,
+        layers: positive(&field("num_hidden_layers"), raw.num_hidden_layers)?,
+        heads,
+        kv_heads,
+        head_dim,
+        patch_size,
+        pooling_kernel_size,
+        position_embedding_size: positive(
+            &field("position_embedding_size"),
+            raw.position_embedding_size,
+        )?,
+        max_soft_tokens: positive(&field("default_output_length"), raw.default_output_length)?,
+        rms_norm_eps,
+        rope_theta,
+        image_token_id,
+        boi_token_id,
+        eoi_token_id,
     })
 }
