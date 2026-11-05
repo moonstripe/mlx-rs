@@ -1,0 +1,15 @@
+{
+  "mutations_detected": [
+    "channel_major_patches",
+    "swap_axes",
+    "column_major_pool",
+    "vision_no_v_norm"
+  ],
+  "provenance": "numpy 2.2.6 f32 reference, numpy_reference/embedding_gemma2_vision.py",
+  "tolerances": {
+    "embeddings": {
+      "atol": 0.0002,
+      "rtol": 0.0002
+    }
+  }
+}

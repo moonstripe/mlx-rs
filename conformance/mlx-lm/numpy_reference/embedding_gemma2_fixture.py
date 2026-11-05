@@ -21,7 +21,7 @@ from numpy_reference.common import read_json, read_safetensors, write_safetensor
 from numpy_reference.embedding_gemma2 import EmbeddingGemma2Text
 
 ROOT = Path(__file__).resolve().parents[1]
-OUTPUT = ROOT / "embedding-fixtures" / "embedding-gemma2-text"
+OUTPUT = ROOT / "embedding-fixtures"
 NUMPY_VERSION = "2.2.6"
 SEED = 1729
 TOLERANCE = {"atol": 2e-4, "rtol": 2e-4}
@@ -173,15 +173,24 @@ def encode(text):
     return [2] + [VOCAB.index(word) for word in text.split()] + [1]
 
 
-def write(directory):
+def dump(value):
+    return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def write_common(directory, config, tokenizer, tensors):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    dump = lambda value: json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    (directory / "config.json").write_text(dump(CONFIG))
-    (directory / "tokenizer.json").write_text(dump(tokenizer_json()))
+    (directory / "config.json").write_text(dump(config))
+    (directory / "tokenizer.json").write_text(dump(tokenizer))
     (directory / "tokenizer_config.json").write_text(dump({"bos_token": "<bos>", "eos_token": "<eos>", "pad_token": "<pad>"}))
-    write_safetensors(directory / "model.safetensors", weights())
-    tensors = read_safetensors(directory / "model.safetensors")
+    write_safetensors(directory / "model.safetensors", tensors)
+    return read_safetensors(directory / "model.safetensors")
+
+
+
+def write_text(directory):
+    directory = Path(directory)
+    tensors = write_common(directory, CONFIG, tokenizer_json(), weights())
     ids = [encode(text) for text in TEXTS]
     batch = EmbeddingGemma2Text(CONFIG, tensors).embed(ids)
     singles = np.concatenate([EmbeddingGemma2Text(CONFIG, tensors).embed([s]) for s in ids])
@@ -204,6 +213,126 @@ def write(directory):
     write_safetensors(directory / "expectations.safetensors", {"embeddings": batch})
 
 
+VISION_SEED = SEED + 1
+VISION_MUTATIONS = ["channel_major_patches", "swap_axes", "column_major_pool", "vision_no_v_norm"]
+
+
+def vision_config():
+    config = json.loads(json.dumps(CONFIG))
+    config["boi_token_id"] = VOCAB.index("w0")
+    config["eoi_token_id"] = VOCAB.index("w1")
+    # GQA, an axial head of 8 (two rotated halves of 4), 2x2 patches pooled 3x3.
+    config["vision_config"] = {
+        "model_type": "gemma4_vision",
+        "attention_bias": False,
+        "default_output_length": 6,
+        "global_head_dim": 8,
+        "head_dim": 8,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_attention_heads": 2,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 1,
+        "patch_size": 2,
+        "pooling_kernel_size": 3,
+        "position_embedding_size": 16,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {"rope_theta": 100.0, "rope_type": "axial"},
+        "standardize": False,
+        "use_clipped_linears": False,
+    }
+    return config
+
+
+def vision_tokenizer():
+    tokenizer = tokenizer_json()
+    vocab = tokenizer["model"]["vocab"]
+    for filler, name in (("w0", "<|image>"), ("w1", "<image|>")):
+        vocab[name] = vocab.pop(filler)
+        tokenizer["added_tokens"].append({"id": vocab[name], "content": name, "single_word": False,
+                                          "lstrip": False, "rstrip": False, "normalized": False, "special": True})
+    tokenizer["added_tokens"].sort(key=lambda token: token["id"])
+    return tokenizer
+
+
+def vision_weights(config):
+    c = config["vision_config"]
+    hidden, inter, dim = c["hidden_size"], c["intermediate_size"], c["head_dim"]
+    q, kv = c["num_attention_heads"] * dim, c["num_key_value_heads"] * dim
+    shapes = {
+        "vision_tower.patch_embedder.input_proj.weight": (hidden, 3 * c["patch_size"] ** 2),
+        "vision_tower.patch_embedder.position_embedding_table": (2, c["position_embedding_size"], hidden),
+        "embed_vision.embedding_projection.weight": (config["text_config"]["hidden_size"], hidden),
+    }
+    for i in range(c["num_hidden_layers"]):
+        l = f"vision_tower.encoder.layers.{i}."
+        shapes.update({
+            l + "self_attn.q_proj.linear.weight": (q, hidden),
+            l + "self_attn.k_proj.linear.weight": (kv, hidden),
+            l + "self_attn.v_proj.linear.weight": (kv, hidden),
+            l + "self_attn.o_proj.linear.weight": (hidden, q),
+            l + "self_attn.q_norm.weight": (dim,),
+            l + "self_attn.k_norm.weight": (dim,),
+            l + "mlp.gate_proj.linear.weight": (inter, hidden),
+            l + "mlp.up_proj.linear.weight": (inter, hidden),
+            l + "mlp.down_proj.linear.weight": (hidden, inter),
+            l + "input_layernorm.weight": (hidden,),
+            l + "post_attention_layernorm.weight": (hidden,),
+            l + "pre_feedforward_layernorm.weight": (hidden,),
+            l + "post_feedforward_layernorm.weight": (hidden,),
+        })
+    rng = np.random.Generator(np.random.PCG64(VISION_SEED))
+    tensors = {}
+    for name, shape in sorted(shapes.items()):
+        if name.endswith("position_embedding_table"):
+            value = rng.normal(0, 0.5, shape)
+        elif len(shape) == 2:
+            value = rng.normal(0, shape[1] ** -0.5, shape)
+        else:
+            value = rng.uniform(0.5, 1.5, shape)
+        tensors[name] = value.astype(np.float32)
+    return tensors
+
+
+def vision_images():
+    rng = np.random.Generator(np.random.PCG64(VISION_SEED))
+    # 6 x 9 patches pool to 2 x 3 tokens; 6 x 6 pixels is one token. Non-square
+    # grids distinguish rows from columns.
+    return [rng.integers(0, 256, shape, dtype=np.uint8) for shape in ((12, 18, 3), (6, 6, 3))]
+
+
+def write_vision(directory):
+    from numpy_reference.embedding_gemma2_vision import EmbeddingGemma2Images
+
+    directory = Path(directory)
+    config = vision_config()
+    text = {k: v for k, v in weights().items() if not k.startswith("vision_tower.")}
+    tensors = write_common(directory, config, vision_tokenizer(), {**text, **vision_weights(config)})
+    images = vision_images()
+    batch = EmbeddingGemma2Images(config, tensors).embed_images(images)
+    singles = np.concatenate([EmbeddingGemma2Images(config, tensors).embed_images([i]) for i in images])
+    if not np.isfinite(batch).all():
+        raise ValueError("reference embeddings are not finite")
+    if not np.allclose(batch, singles, atol=1e-6, rtol=0):
+        raise ValueError("reference rows depend on batch padding")
+    for mutation in VISION_MUTATIONS:
+        mutated = EmbeddingGemma2Images(config, tensors, mutation).embed_images(images)
+        excess = np.abs(mutated - batch) - (TOLERANCE["atol"] + TOLERANCE["rtol"] * np.abs(batch))
+        if excess.max() <= 0:
+            raise ValueError(f"fixture does not detect mutation {mutation}")
+    write_safetensors(directory / "images.safetensors", {f"image{i}": image for i, image in enumerate(images)})
+    (directory / "expectations.json").write_text(dump({
+        "provenance": f"numpy {NUMPY_VERSION} f32 reference, numpy_reference/embedding_gemma2_vision.py",
+        "tolerances": {"embeddings": TOLERANCE},
+        "mutations_detected": VISION_MUTATIONS,
+    }))
+    write_safetensors(directory / "expectations.safetensors", {"embeddings": batch})
+
+
+FIXTURES = {"embedding-gemma2-text": write_text, "embedding-gemma2-vision": write_vision}
+
+
 def digest(directory):
     h = hashlib.sha256()
     for path in sorted(Path(directory).iterdir()):
@@ -217,18 +346,20 @@ def main():
     args = parser.parse_args()
     if np.__version__ != NUMPY_VERSION:
         parser.error(f"requires numpy {NUMPY_VERSION}, got {np.__version__}")
-    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
-        write(a)
-        write(b)
-        if digest(a) != digest(b):
-            raise SystemExit("generation is not deterministic")
-        if args.check:
-            if not OUTPUT.is_dir() or digest(a) != digest(OUTPUT):
-                raise SystemExit(f"{OUTPUT} differs from regeneration")
-            print("fixture matches regeneration")
-            return
-    write(OUTPUT)
-    print(OUTPUT)
+    for name, write in FIXTURES.items():
+        output = OUTPUT / name
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            write(a)
+            write(b)
+            if digest(a) != digest(b):
+                raise SystemExit(f"{name}: generation is not deterministic")
+            if args.check:
+                if not output.is_dir() or digest(a) != digest(output):
+                    raise SystemExit(f"{output} differs from regeneration")
+                print(f"{name}: matches regeneration")
+                continue
+        write(output)
+        print(output)
 
 
 if __name__ == "__main__":

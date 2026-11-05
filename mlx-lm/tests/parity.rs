@@ -76,6 +76,16 @@ fn embedding_gemma2_text_metal() -> Result<()> {
 }
 
 #[test]
+fn embedding_gemma2_vision_cpu() -> Result<()> {
+    embedding::run_vision(mlx_rs::Device::cpu())
+}
+
+#[test]
+fn embedding_gemma2_vision_metal() -> Result<()> {
+    embedding::run_vision(mlx_rs::Device::gpu())
+}
+
+#[test]
 fn gguf_mutation_qualification() -> Result<()> {
     gguf::qualify_mutations()
 }

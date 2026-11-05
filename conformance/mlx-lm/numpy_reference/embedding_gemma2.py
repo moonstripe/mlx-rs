@@ -101,12 +101,16 @@ class EmbeddingGemma2Text:
         return self.linear(out, prefix + ".o_proj")
 
     def hidden(self, ids, valid):
+        x = self.w("embed_tokens.weight")[ids] * np.float32(np.sqrt(self.text["hidden_size"]))
+        return self.hidden_from_embeddings(x, valid)
+
+    def hidden_from_embeddings(self, x, valid):
+        """Projected states for scaled input embeddings `[batch, length, hidden]`."""
         text = self.text
         hidden = text["hidden_size"]
         count, width = len(self.layers), text["hidden_size_per_layer_input"]
-        x = self.w("embed_tokens.weight")[ids] * np.float32(np.sqrt(hidden))
         per_layer = self.linear(x, "ple.per_layer_model_projection") * np.float32(hidden**-0.5)
-        per_layer = per_layer.reshape(*ids.shape, count, width)
+        per_layer = per_layer.reshape(*x.shape[:2], count, width)
         per_layer = self.norm(per_layer, "ple.per_layer_projection_norm")
         for i, shape in enumerate(self.layers):
             p = f"layers.{i}"
@@ -130,7 +134,9 @@ class EmbeddingGemma2Text:
         pad = self.text["pad_token_id"]
         ids = np.array([s + [pad] * (length - len(s)) for s in sequences], np.int64)
         valid = np.array([[True] * len(s) + [False] * (length - len(s)) for s in sequences])
-        states = self.hidden(ids, valid)
+        return self.pool(self.hidden(ids, valid), valid)
+
+    def pool(self, states, valid):
         mask = valid[..., None].astype(np.float32)
         if self.mutation == "pool_padding":
             mask = np.ones_like(mask)

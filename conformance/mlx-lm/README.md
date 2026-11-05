@@ -571,7 +571,7 @@ directories and processor templates are outside this fix's admitted profile.
 Regenerate twice with `--output-dir PATH` and compare the trees before replacing
 the committed fixtures; the generator checks the full pinned environment.
 
-## EmbeddingGemma 2 text embeddings
+## EmbeddingGemma 2 embeddings
 
 `numpy_reference/embedding_gemma2.py` is an independent f32 NumPy encoder that
 imports no MLX. `numpy_reference/embedding_gemma2_fixture.py` writes the seeded
@@ -589,8 +589,21 @@ conformance/.venv-mlx-lm/bin/python -B conformance/mlx-lm/numpy_reference/embedd
 cargo test -p mlx-lm --features oracle-hooks --test parity embedding_gemma2 -- --test-threads=1
 ```
 
+`numpy_reference/embedding_gemma2_vision.py` adds the Gemma 4 vision tower:
+HF-processor rescaling (f64 `rescale_factor`, stored f32), row-major patches with
+column/row position embeddings, axial RoPE, bidirectional layers, `k x k` average
+pooling and `embed_vision`. The same script writes
+`embedding-fixtures/embedding-gemma2-vision/` (text weights from seed 1729,
+tower weights and two images from seed 1730): GQA, 2-pixel patches pooled 3x3,
+a 12x18 image (2x3 soft tokens) and a 6x6 image (one token) padded in one batch.
+Its mutations are channel-major patches, swapped image axes, column-major
+pooling and a missing tower value norm.
+
 NumPy 2.2.6's Accelerate matmul can print spurious floating-point warnings; the
 generator rejects non-finite expectations. As provenance, not a gate: on
 2026-11-05 the reference agreed with mlx-vlm 3d87e884 on
 `mlx-community/embeddinggemma-2-bf16` (four texts, cosine ≥ 0.99989 against
 bf16 execution), and the Rust Metal embeddings were bit-identical to mlx-vlm's.
+For images (a 144x240 gradient and a 96x48 noise image), the vision reference
+agreed with mlx-vlm run in f32 to 5.3e-7, and Rust bf16 agreed with mlx-vlm
+bf16 at cosine ≥ 0.99991 on Metal and ≥ 0.99967 on CPU.
