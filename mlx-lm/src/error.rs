@@ -407,6 +407,25 @@ pub enum EmbeddingError {
         /// Width in pixels.
         width: usize,
     },
+    /// The checkpoint configuration declares no audio tower.
+    #[error("the checkpoint has no audio tower")]
+    NoAudioTower,
+    /// A waveform is too short to yield one audio soft token.
+    #[error("waveform {input} of {samples} samples yields no audio token")]
+    AudioTooShort {
+        /// Zero-based index in the supplied batch.
+        input: usize,
+        /// Supplied sample count.
+        samples: usize,
+    },
+    /// A waveform contains a NaN or infinite sample.
+    #[error("waveform {input} has a non-finite sample at {index}")]
+    NonFiniteSample {
+        /// Zero-based index in the supplied batch.
+        input: usize,
+        /// Zero-based sample index.
+        index: usize,
+    },
     /// Preserves the source diagnostic.
     #[error(transparent)]
     Tokenizer(#[from] TokenizerError),

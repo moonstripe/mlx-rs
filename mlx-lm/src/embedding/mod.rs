@@ -1,5 +1,6 @@
-//! EmbeddingGemma 2 text and image embeddings.
+//! EmbeddingGemma 2 text, image and audio embeddings.
 
+mod audio;
 mod config;
 #[cfg(test)]
 mod tests;
@@ -10,6 +11,7 @@ use crate::{
     weights::{WeightDisposition, WeightManifest},
     EmbeddingError, LoadError, TokenId, Tokenizer, WeightError,
 };
+use audio::AudioTower;
 use config::{EncoderConfig, LayerShape};
 use mlx_rs::{fast, nn, ops, utils::StateProjection, Array, Dtype};
 use std::{marker::PhantomData, path::Path, rc::Rc};
@@ -17,8 +19,6 @@ use vision::VisionTower;
 
 /// External prefix of the text encoder's tensors in MLX-layout checkpoints.
 const TEXT_PREFIX: &str = "language_model.";
-/// Audio tensors this embedder leaves unloaded.
-const AUDIO_PREFIXES: [&str; 2] = ["audio_tower.", "embed_audio."];
 
 /// An RGB image already resized for the vision tower: `height * width * 3` bytes,
 /// row-major, channels interleaved.
@@ -57,7 +57,7 @@ impl<'a> RgbImage<'a> {
     }
 }
 
-/// A loaded EmbeddingGemma 2 encoder, its optional vision tower and its tokenizer.
+/// A loaded EmbeddingGemma 2 encoder, its optional media towers and its tokenizer.
 ///
 /// [`Embedder::embed`] tokenizes each text with the tokenizer's post-processor
 /// (`<bos>` and `<eos>` for the published checkpoints), right-pads the batch with
@@ -66,14 +66,15 @@ impl<'a> RgbImage<'a> {
 /// Prompts such as `task: search result | query: ` from the checkpoint's
 /// `config_sentence_transformers.json` are part of the caller's text.
 ///
-/// [`Embedder::embed_images`] encodes each image with the vision tower and places
-/// its soft tokens in `<bos> <boi> <image> * n <eoi> <eos>`, which the same encoder
-/// pools into the shared embedding space.
+/// [`Embedder::embed_images`] and [`Embedder::embed_audio`] encode each input with
+/// its tower and place the soft tokens in `<bos> <boi> <image> * n <eoi> <eos>` or
+/// `<bos> <boa> <audio> * n <eoa> <eos>`, which the same encoder pools into the
+/// shared embedding space.
 ///
-/// The vision tower loads when `config.json` declares `vision_config`. Audio
-/// tensors in the checkpoint are ignored, and texts that tokenize to media
-/// placeholder tokens are rejected. Weights must be floating point; quantized
-/// checkpoints are rejected.
+/// The vision tower loads when `config.json` declares `vision_config`, and the
+/// audio tower when it declares `audio_config` (which also requires
+/// `preprocessor_config.json`). Texts that tokenize to media placeholder tokens
+/// are rejected. Weights must be floating point; quantized checkpoints are rejected.
 ///
 /// `Embedder` is `!Send` and `!Sync`: create, use and drop it on one OS thread inside
 /// the chosen device or stream scope.
@@ -90,10 +91,9 @@ impl Embedder {
     /// from a local EmbeddingGemma 2 checkpoint directory.
     ///
     /// Every `language_model.*` tensor must fill exactly one encoder parameter with
-    /// the expected shape, and so must every `vision_tower.*` and `embed_vision.*`
-    /// tensor when the configuration declares a vision tower (they are ignored
-    /// otherwise). `audio_tower.*` and `embed_audio.*` tensors are ignored; any
-    /// other tensor is an error.
+    /// the expected shape, and so must every `vision_tower.*`/`embed_vision.*` and
+    /// `audio_tower.*`/`embed_audio.*` tensor when the configuration declares that
+    /// tower (they are ignored otherwise); any other tensor is an error.
     pub fn from_dir(path: impl AsRef<Path>) -> Result<Self, LoadError> {
         let path = path.as_ref();
         let config_path = path.join("config.json");
@@ -105,19 +105,34 @@ impl Embedder {
             }
         })?;
         let config = config::parse(&bytes)?;
+        let front_end = if config.audio.is_some() {
+            let path = path.join("preprocessor_config.json");
+            let bytes = std::fs::read(&path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    LoadError::MissingFile(path)
+                } else {
+                    LoadError::Io(error)
+                }
+            })?;
+            Some(config::parse_front_end(&bytes)?)
+        } else {
+            None
+        };
         let tokenizer = Tokenizer::from_dir(path).map_err(|error| match error {
             crate::TokenizerError::MissingFile(missing) => LoadError::MissingFile(missing),
             other => LoadError::Tokenizer(other),
         })?;
-        let specials = match config.vision.as_ref().map(|vision| vision.boi_token_id) {
+        let marker = (config.vision.as_ref().map(|vision| vision.boi_token_id))
+            .or(config.audio.as_ref().map(|audio| audio.boa_token_id));
+        let specials = match marker {
             Some(marker) => special_frame(&tokenizer, marker)?,
             None => (Vec::new(), Vec::new()),
         };
         let manifest = WeightManifest::discover(path)?;
-        let with_vision = config.vision.is_some();
-        let mut encoder = Encoder::new(config, &manifest)?;
+        let towers = (config.vision.is_some(), config.audio.is_some());
+        let mut encoder = Encoder::new(config, front_end, &manifest)?;
         manifest.load_with(&mut encoder.weight_projection()?, |key| {
-            map_key(key, with_vision)
+            map_key(key, towers)
         })?;
         Ok(Self {
             encoder,
@@ -242,11 +257,69 @@ impl Embedder {
         embeddings.eval()?;
         Ok(embeddings)
     }
+
+    /// Embeds a batch of mono waveforms into an evaluated `f32` array of shape
+    /// `[waveforms.len(), dimension()]` whose rows have unit L2 norm, in the same
+    /// space as [`Embedder::embed`].
+    ///
+    /// Samples are at the front-end's `sampling_rate` (16 kHz for the published
+    /// checkpoints); resampling and channel mixing are the caller's. Unlike the
+    /// published processor, which truncates at 30 s, waveforms are not truncated.
+    pub fn embed_audio(&self, waveforms: &[&[f32]]) -> Result<Array, EmbeddingError> {
+        let audio = self
+            .encoder
+            .audio
+            .as_ref()
+            .ok_or(EmbeddingError::NoAudioTower)?;
+        if waveforms.is_empty() {
+            return Err(EmbeddingError::EmptyBatch);
+        }
+        let c = &audio.config;
+        let (bos, eos) = &self.specials;
+        let mut sequences = Vec::with_capacity(waveforms.len());
+        for (input, waveform) in waveforms.iter().enumerate() {
+            let (frames, valid) = audio.front_end.frames(waveform.len());
+            let tokens = audio.tokens(frames, valid);
+            if tokens == 0 {
+                return Err(EmbeddingError::AudioTooShort {
+                    input,
+                    samples: waveform.len(),
+                });
+            }
+            if let Some(index) = waveform.iter().position(|sample| !sample.is_finite()) {
+                return Err(EmbeddingError::NonFiniteSample { input, index });
+            }
+            let length = bos.len() + tokens + 2 + eos.len();
+            if length > self.encoder.config.max_positions {
+                return Err(EmbeddingError::SequenceTooLong {
+                    input,
+                    length,
+                    limit: self.encoder.config.max_positions,
+                });
+            }
+            let mut ids = bos.clone();
+            ids.push(TokenId::from(c.boa_token_id));
+            ids.extend(std::iter::repeat_n(TokenId::from(c.audio_token_id), tokens));
+            ids.push(TokenId::from(c.eoa_token_id));
+            ids.extend(eos);
+            sequences.push(ids);
+        }
+        let features = waveforms
+            .iter()
+            .map(|waveform| audio.features(waveform))
+            .collect::<Result<Vec<_>, _>>()?;
+        let features = ops::concatenate(&features, 0)?;
+        let embeddings = self
+            .encoder
+            .embed(&sequences, Some((c.audio_token_id, &features)))?;
+        embeddings.eval()?;
+        Ok(embeddings)
+    }
 }
 
 /// Tokens the post-processor places before and after a text, found by encoding a
 /// media marker's own content with special tokens, as the published processor
-/// encodes `<boi> <image> * n <eoi>`.
+/// encodes `<boi> <image> * n <eoi>` and `<boa> <audio> * n <eoa>`.
 fn special_frame(
     tokenizer: &Tokenizer,
     marker: u32,
@@ -269,27 +342,33 @@ fn special_frame(
     Ok((ids[..at].to_vec(), ids[at + 1..].to_vec()))
 }
 
-fn map_key(external: &str, with_vision: bool) -> WeightDisposition {
+fn map_key(external: &str, (with_vision, with_audio): (bool, bool)) -> WeightDisposition {
+    let tower = |prefixes: &[&str], loaded: bool, reason| {
+        prefixes
+            .iter()
+            .any(|prefix| external.starts_with(prefix))
+            .then(|| {
+                if loaded {
+                    WeightDisposition::Parameter(ParameterPath::new(external))
+                } else {
+                    WeightDisposition::Ignore { reason }
+                }
+            })
+    };
     if let Some(internal) = external.strip_prefix(TEXT_PREFIX) {
         WeightDisposition::Parameter(ParameterPath::new(internal))
-    } else if vision::PREFIXES
-        .iter()
-        .any(|prefix| external.starts_with(prefix))
-    {
-        if with_vision {
-            WeightDisposition::Parameter(ParameterPath::new(external))
-        } else {
-            WeightDisposition::Ignore {
-                reason: "the configuration declares no vision tower",
-            }
-        }
-    } else if AUDIO_PREFIXES
-        .iter()
-        .any(|prefix| external.starts_with(prefix))
-    {
-        WeightDisposition::Ignore {
-            reason: "the audio tower is not loaded by the embedder",
-        }
+    } else if let Some(disposition) = tower(
+        &vision::PREFIXES,
+        with_vision,
+        "the configuration declares no vision tower",
+    ) {
+        disposition
+    } else if let Some(disposition) = tower(
+        &audio::PREFIXES,
+        with_audio,
+        "the configuration declares no audio tower",
+    ) {
+        disposition
     } else {
         WeightDisposition::Reject
     }
@@ -504,10 +583,15 @@ struct Encoder {
     rope_keys: Vec<RopeKey>,
     layer_rope: Vec<usize>,
     vision: Option<VisionTower>,
+    audio: Option<AudioTower>,
 }
 
 impl Encoder {
-    fn new(config: EncoderConfig, manifest: &WeightManifest) -> Result<Self, WeightError> {
+    fn new(
+        config: EncoderConfig,
+        front_end: Option<config::FrontEnd>,
+        manifest: &WeightManifest,
+    ) -> Result<Self, WeightError> {
         let hidden = config.hidden_size;
         let layers = config
             .layers
@@ -535,6 +619,12 @@ impl Encoder {
             .clone()
             .map(|vision| VisionTower::new(vision, hidden, manifest))
             .transpose()?;
+        let audio = config
+            .audio
+            .clone()
+            .zip(front_end)
+            .map(|(audio, front_end)| AudioTower::new(audio, front_end, hidden, manifest))
+            .transpose()?;
         Ok(Self {
             embed_tokens: slot(
                 manifest,
@@ -561,6 +651,7 @@ impl Encoder {
             rope_keys,
             layer_rope,
             vision,
+            audio,
             config,
         })
     }
@@ -586,6 +677,9 @@ impl Encoder {
         )?;
         if let Some(vision) = &mut self.vision {
             vision.project(&mut projection)?;
+        }
+        if let Some(audio) = &mut self.audio {
+            audio.project(&mut projection)?;
         }
         Ok(projection)
     }

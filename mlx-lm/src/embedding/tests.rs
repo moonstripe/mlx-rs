@@ -162,3 +162,79 @@ fn rejects_vision_towers_without_matching_tensors_or_semantics() {
         assert!(parse_value(&value).is_err(), "{label} was accepted");
     }
 }
+
+fn with_audio() -> Value {
+    let mut value = base();
+    value["boa_token_id"] = json!(57);
+    value["eoa_token_index"] = json!(58);
+    value["audio_config"] = json!({
+        "model_type": "gemma4_audio",
+        "attention_chunk_size": 12,
+        "attention_context_left": 13,
+        "attention_context_right": 0,
+        "attention_invalid_logits_value": -1e9,
+        "attention_logit_cap": 50.0,
+        "conv_kernel_size": 5,
+        "gradient_clipping": 1e10,
+        "hidden_act": "silu",
+        "hidden_size": 16,
+        "num_attention_heads": 2,
+        "num_hidden_layers": 1,
+        "output_proj_dims": 24,
+        "residual_weight": 0.5,
+        "rms_norm_eps": 1e-6,
+        "subsampling_conv_channels": [4, 2],
+        "use_clipped_linears": true
+    });
+    value
+}
+
+#[test]
+fn audio_window_excludes_the_context_left_key() {
+    // `attention_context_left: 13` admits the current frame and 11 earlier ones.
+    let audio = parse_value(&with_audio()).unwrap().audio.unwrap();
+    assert_eq!((audio.chunk_past, audio.chunk_future), (12, 0));
+    assert_eq!(
+        (audio.audio_token_id, audio.boa_token_id, audio.eoa_token_id),
+        (62, 57, 58)
+    );
+}
+
+#[test]
+fn rejects_audio_towers_and_front_ends_outside_the_profile() {
+    let cases: [(&str, Mutation); 4] = [
+        ("unclipped linears", |v| {
+            v["audio_config"]["use_clipped_linears"] = json!(false)
+        }),
+        ("gelu", |v| v["audio_config"]["hidden_act"] = json!("gelu")),
+        ("no output projection", |v| {
+            v["audio_config"]["output_proj_dims"] = Value::Null
+        }),
+        ("missing eoa", |v| {
+            v.as_object_mut().unwrap().remove("eoa_token_index");
+        }),
+    ];
+    for (label, mutate) in cases {
+        let mut value = with_audio();
+        mutate(&mut value);
+        assert!(parse_value(&value).is_err(), "{label} was accepted");
+    }
+    let front_end = json!({
+        "feature_extractor_type": "Gemma4AudioFeatureExtractor",
+        "feature_size": 128, "fft_length": 512, "frame_length": 320, "hop_length": 160,
+        "max_frequency": 8000.0, "min_frequency": 0.0, "mel_floor": 0.001,
+        "sampling_rate": 16000, "per_bin_mean": null, "per_bin_stddev": null
+    });
+    let parse = |v: &Value| super::config::parse_front_end(&serde_json::to_vec(v).unwrap());
+    assert!(parse(&front_end).is_ok());
+    for (key, value) in [
+        ("preemphasis", json!(0.97)),
+        ("dither", json!(1e-5)),
+        ("per_bin_mean", json!([0.0])),
+        ("fft_length", json!(256)),
+    ] {
+        let mut changed = front_end.clone();
+        changed[key] = value;
+        assert!(parse(&changed).is_err(), "{key} was accepted");
+    }
+}

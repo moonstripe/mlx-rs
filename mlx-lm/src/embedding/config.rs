@@ -21,6 +21,8 @@ pub(super) struct EncoderConfig {
     pub(super) layers: Vec<LayerShape>,
     /// Present when the checkpoint declares a vision tower.
     pub(super) vision: Option<VisionConfig>,
+    /// Present when the checkpoint declares an audio tower.
+    pub(super) audio: Option<AudioConfig>,
 }
 
 /// Validated Gemma 4 vision-tower facts and the image placeholder tokens.
@@ -44,6 +46,41 @@ pub(super) struct VisionConfig {
     pub(super) eoi_token_id: u32,
 }
 
+/// Validated Gemma 4 audio-encoder facts and the audio placeholder tokens.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct AudioConfig {
+    pub(super) hidden_size: usize,
+    pub(super) layers: usize,
+    pub(super) heads: usize,
+    /// Output channels of each stride-2 subsampling convolution.
+    pub(super) subsampling_channels: Vec<usize>,
+    pub(super) conv_kernel_size: usize,
+    pub(super) chunk_past: usize,
+    pub(super) chunk_future: usize,
+    pub(super) invalid_logit: f32,
+    pub(super) logit_cap: f32,
+    pub(super) gradient_clipping: f32,
+    pub(super) residual_weight: f32,
+    pub(super) output_dims: usize,
+    pub(super) rms_norm_eps: f32,
+    pub(super) audio_token_id: u32,
+    pub(super) boa_token_id: u32,
+    pub(super) eoa_token_id: u32,
+}
+
+/// The admitted log-mel front-end from `preprocessor_config.json`.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct FrontEnd {
+    pub(super) sampling_rate: usize,
+    pub(super) feature_size: usize,
+    pub(super) frame_length: usize,
+    pub(super) hop_length: usize,
+    pub(super) fft_length: usize,
+    pub(super) min_frequency: f64,
+    pub(super) max_frequency: f64,
+    pub(super) mel_floor: f64,
+}
+
 /// One encoder layer's attention geometry after `per_layer_config` overrides.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct LayerShape {
@@ -63,6 +100,57 @@ struct RawConfig {
     boi_token_id: Option<u32>,
     eoi_token_id: Option<u32>,
     vision_config: Option<RawVision>,
+    boa_token_id: Option<u32>,
+    eoa_token_index: Option<u32>,
+    audio_config: Option<RawAudio>,
+}
+
+#[derive(Deserialize)]
+struct RawAudio {
+    model_type: String,
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    subsampling_conv_channels: Vec<usize>,
+    conv_kernel_size: usize,
+    attention_chunk_size: usize,
+    attention_context_left: usize,
+    attention_context_right: usize,
+    attention_invalid_logits_value: f64,
+    attention_logit_cap: f64,
+    gradient_clipping: f64,
+    hidden_act: String,
+    output_proj_dims: Option<usize>,
+    residual_weight: f64,
+    rms_norm_eps: f64,
+    use_clipped_linears: bool,
+}
+
+#[derive(Deserialize)]
+struct RawFrontEnd {
+    feature_extractor_type: String,
+    sampling_rate: usize,
+    feature_size: usize,
+    frame_length: usize,
+    hop_length: usize,
+    fft_length: usize,
+    min_frequency: f64,
+    max_frequency: f64,
+    mel_floor: f64,
+    #[serde(default)]
+    dither: f64,
+    #[serde(default)]
+    preemphasis: f64,
+    #[serde(default)]
+    fft_overdrive: bool,
+    #[serde(default = "unit")]
+    input_scale_factor: f64,
+    per_bin_mean: Option<serde_json::Value>,
+    per_bin_stddev: Option<serde_json::Value>,
+}
+
+fn unit() -> f64 {
+    1.0
 }
 
 #[derive(Deserialize)]
@@ -303,6 +391,8 @@ pub(super) fn parse(bytes: &[u8]) -> Result<EncoderConfig, ConfigError> {
         .iter()
         .chain(&raw.boi_token_id)
         .chain(&raw.eoi_token_id)
+        .chain(&raw.boa_token_id)
+        .chain(&raw.eoa_token_index)
         .find(|&&id| id as usize >= vocabulary_size)
     {
         return Err(invalid(
@@ -310,19 +400,30 @@ pub(super) fn parse(bytes: &[u8]) -> Result<EncoderConfig, ConfigError> {
             format!("{token} is outside the vocabulary"),
         ));
     }
+    let token = |field: &str, id: Option<u32>| {
+        id.ok_or_else(|| ConfigError::MissingField {
+            field: field.into(),
+        })
+    };
     let vision = raw
         .vision_config
         .map(|vision| {
-            let token = |field: &str, id: Option<u32>| {
-                id.ok_or_else(|| ConfigError::MissingField {
-                    field: field.into(),
-                })
-            };
             parse_vision(
                 vision,
                 token("image_token_id", raw.image_token_id)?,
                 token("boi_token_id", raw.boi_token_id)?,
                 token("eoi_token_id", raw.eoi_token_id)?,
+            )
+        })
+        .transpose()?;
+    let audio = raw
+        .audio_config
+        .map(|audio| {
+            parse_audio(
+                audio,
+                token("audio_token_id", raw.audio_token_id)?,
+                token("boa_token_id", raw.boa_token_id)?,
+                token("eoa_token_index", raw.eoa_token_index)?,
             )
         })
         .transpose()?;
@@ -339,6 +440,147 @@ pub(super) fn parse(bytes: &[u8]) -> Result<EncoderConfig, ConfigError> {
         media_tokens,
         layers,
         vision,
+        audio,
+    })
+}
+
+fn parse_audio(
+    raw: RawAudio,
+    audio_token_id: u32,
+    boa_token_id: u32,
+    eoa_token_id: u32,
+) -> Result<AudioConfig, ConfigError> {
+    let unsupported = |what: String| {
+        Err(ConfigError::UnsupportedArchitecture(format!(
+            "{MODEL_TYPE} audio tower with {what}"
+        )))
+    };
+    if raw.model_type != "gemma4_audio" {
+        return unsupported(format!("model_type {}", raw.model_type));
+    }
+    if raw.hidden_act != "silu" {
+        return unsupported(format!("hidden_act {}", raw.hidden_act));
+    }
+    // Both checkpoint forms carry clip bounds for every audio linear.
+    if !raw.use_clipped_linears {
+        return unsupported("unclipped linears".into());
+    }
+    let Some(output_dims) = raw.output_proj_dims else {
+        return unsupported("no output projection".into());
+    };
+    let field = |name: &str| format!("audio_config.{name}");
+    let hidden_size = positive(&field("hidden_size"), raw.hidden_size)?;
+    let heads = positive(&field("num_attention_heads"), raw.num_attention_heads)?;
+    if hidden_size % heads != 0 {
+        return Err(invalid(
+            field("num_attention_heads"),
+            "must divide hidden_size",
+        ));
+    }
+    if hidden_size % 2 != 0 {
+        return Err(invalid(
+            field("hidden_size"),
+            "sinusoids need an even width",
+        ));
+    }
+    // The feature extractor's 128 mel bins, halved by each stride-2 convolution,
+    // times the last channel count feed the input projection.
+    if raw.subsampling_conv_channels.is_empty() {
+        return Err(invalid(
+            field("subsampling_conv_channels"),
+            "must not be empty",
+        ));
+    }
+    for &channels in &raw.subsampling_conv_channels {
+        positive(&field("subsampling_conv_channels"), channels)?;
+    }
+    if raw.attention_chunk_size == 0 {
+        return Err(invalid(field("attention_chunk_size"), "must be positive"));
+    }
+    // Each frame must see at least itself or one neighbor.
+    if raw.attention_context_left < 2 && raw.attention_context_right < 2 {
+        return Err(invalid(
+            field("attention_context_left"),
+            "the attention window admits no key",
+        ));
+    }
+    let finite = |name: &str, value: f64| {
+        let value = value as f32;
+        if value.is_finite() {
+            Ok(value)
+        } else {
+            Err(invalid(field(name), "must be finite"))
+        }
+    };
+    let rms_norm_eps = finite("rms_norm_eps", raw.rms_norm_eps)?;
+    if rms_norm_eps <= 0.0 {
+        return Err(invalid(field("rms_norm_eps"), "must be positive"));
+    }
+    let logit_cap = finite("attention_logit_cap", raw.attention_logit_cap)?;
+    if logit_cap <= 0.0 {
+        return Err(invalid(field("attention_logit_cap"), "must be positive"));
+    }
+    Ok(AudioConfig {
+        hidden_size,
+        layers: positive(&field("num_hidden_layers"), raw.num_hidden_layers)?,
+        heads,
+        subsampling_channels: raw.subsampling_conv_channels,
+        conv_kernel_size: positive(&field("conv_kernel_size"), raw.conv_kernel_size)?,
+        chunk_past: raw.attention_context_left.saturating_sub(1),
+        chunk_future: raw.attention_context_right,
+        invalid_logit: finite(
+            "attention_invalid_logits_value",
+            raw.attention_invalid_logits_value,
+        )?,
+        logit_cap,
+        gradient_clipping: finite("gradient_clipping", raw.gradient_clipping)?,
+        residual_weight: finite("residual_weight", raw.residual_weight)?,
+        output_dims: positive(&field("output_proj_dims"), output_dims)?,
+        rms_norm_eps,
+        audio_token_id,
+        boa_token_id,
+        eoa_token_id,
+    })
+}
+
+/// Parses `preprocessor_config.json`, admitting only the published log-mel
+/// front-end: no dither, preemphasis, input scaling, overdrive or per-bin
+/// normalization, and a frame that fits the FFT. The audio tower's input
+/// projection shape checks `feature_size` against the checkpoint.
+pub(super) fn parse_front_end(bytes: &[u8]) -> Result<FrontEnd, ConfigError> {
+    let raw: RawFrontEnd = serde_json::from_slice(bytes)?;
+    let unsupported = |what: &str| {
+        Err(ConfigError::UnsupportedArchitecture(format!(
+            "{MODEL_TYPE} audio front-end with {what}"
+        )))
+    };
+    if raw.feature_extractor_type != "Gemma4AudioFeatureExtractor" {
+        return unsupported(&raw.feature_extractor_type);
+    }
+    if raw.dither != 0.0 || raw.preemphasis != 0.0 || raw.input_scale_factor != 1.0 {
+        return unsupported("dither, preemphasis or input scaling");
+    }
+    if raw.fft_overdrive || raw.per_bin_mean.is_some() || raw.per_bin_stddev.is_some() {
+        return unsupported("FFT overdrive or per-bin normalization");
+    }
+    let field = |name: &str| format!("preprocessor_config.{name}");
+    let feature_size = positive(&field("feature_size"), raw.feature_size)?;
+    let frame_length = positive(&field("frame_length"), raw.frame_length)?;
+    if raw.fft_length < frame_length || raw.fft_length < 2 {
+        return Err(invalid(field("fft_length"), "must cover frame_length"));
+    }
+    if !(raw.mel_floor > 0.0 && raw.max_frequency > raw.min_frequency && raw.min_frequency >= 0.0) {
+        return Err(invalid(field("mel_floor"), "invalid mel range or floor"));
+    }
+    Ok(FrontEnd {
+        sampling_rate: positive(&field("sampling_rate"), raw.sampling_rate)?,
+        feature_size,
+        frame_length,
+        hop_length: positive(&field("hop_length"), raw.hop_length)?,
+        fft_length: raw.fft_length,
+        min_frequency: raw.min_frequency,
+        max_frequency: raw.max_frequency,
+        mel_floor: raw.mel_floor,
     })
 }
 

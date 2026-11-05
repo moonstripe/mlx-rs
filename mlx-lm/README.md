@@ -23,8 +23,9 @@ or consume the committed fixtures.
 | Hub, `Model::from_hub` | Behind `hf-hub`; resolves a repository/revision to a commit and downloads selected safetensors and JSON/tokenizer assets, then uses the local loader. No remote Python code or Hub GGUF loading. |
 | Generation | One synchronous iterator for text or token-ID prompts, chunked prefill, temperature/top-k/top-p/min-p sampling, repetition/presence/frequency penalties, token and text stops. |
 | Cache | Full and rotating KV storage, model-bound snapshots, exact-prefix reuse. Snapshots exclude RNG, decoder and iterator state. |
-| Text embeddings, `Embedder::from_dir` | EmbeddingGemma 2 (`model_type: embedding_gemma2`) MLX-layout checkpoints such as `mlx-community/embeddinggemma-2-bf16`: floating weights only; audio tensors are ignored. `embed` tokenizes with `<bos>`/`<eos>`, right-pads, runs the bidirectional encoder, mean-pools in `f32` and L2-normalizes. Task prompts (`task: search result \| query: `) are part of the caller's text; Matryoshka truncation is the caller's slice and renormalization. Texts containing media placeholder tokens are rejected. |
+| Text embeddings, `Embedder::from_dir` | EmbeddingGemma 2 (`model_type: embedding_gemma2`) MLX-layout checkpoints such as `mlx-community/embeddinggemma-2-bf16`: floating weights only. `embed` tokenizes with `<bos>`/`<eos>`, right-pads, runs the bidirectional encoder, mean-pools in `f32` and L2-normalizes. Task prompts (`task: search result \| query: `) are part of the caller's text; Matryoshka truncation is the caller's slice and renormalization. Texts containing media placeholder tokens are rejected. |
 | Image embeddings, `Embedder::embed_images` | The same checkpoints' Gemma 4 vision tower, loaded when `config.json` declares `vision_config`. Takes already resized RGB (`RgbImage`): sides that are multiples of 48 pixels with at most 280 soft tokens, as the published processor's aspect-preserving bicubic resize produces; resizing is the caller's. Each image is embedded alone as `<bos> <boi> <image> * n <eoi> <eos>`. Mixed text-and-image inputs and video are not supported. |
+| Audio embeddings, `Embedder::embed_audio` | The same checkpoints' Gemma 4 Conformer audio tower, loaded when `config.json` declares `audio_config`, with the log-mel front-end from `preprocessor_config.json` (no dither, preemphasis or per-bin normalization). Takes mono `f32` samples at the front-end's rate (16 kHz); resampling is the caller's. The published processor truncates at 30 s; this does not. Each waveform is embedded alone as `<bos> <boa> <audio> * n <eoa> <eos>`, one token per 40 ms of complete frames. |
 
 The GGUF affine layouts have group size 32, 4 or 8 bits, and F16 scales and
 biases. Admission examines the arrays after core conversion. Other original
@@ -48,8 +49,9 @@ The [conformance schema](../conformance/mlx-lm/SCHEMA.md),
 results; current bump admission requires fresh executed configuration reports.
 
 The embedder's oracles are independent f32 NumPy encoders,
-[`numpy_reference/embedding_gemma2.py`](../conformance/mlx-lm/numpy_reference/embedding_gemma2.py)
-and [`embedding_gemma2_vision.py`](../conformance/mlx-lm/numpy_reference/embedding_gemma2_vision.py),
+[`numpy_reference/embedding_gemma2.py`](../conformance/mlx-lm/numpy_reference/embedding_gemma2.py),
+[`embedding_gemma2_vision.py`](../conformance/mlx-lm/numpy_reference/embedding_gemma2_vision.py)
+and [`embedding_gemma2_audio.py`](../conformance/mlx-lm/numpy_reference/embedding_gemma2_audio.py),
 checked against seeded fixtures on CPU and Metal. The PyTorch-layout
 `google/embeddinggemma-2` checkpoint does not load; the loader only accepts MLX names.
 
@@ -166,7 +168,7 @@ non-exhaustive, so callers should include a fallback match arm.
 | `CacheError` | Cache layout, policy, model identity, transaction or restoration. |
 | `SamplingError` | Invalid sampling/penalty options, logits or empty candidate support. |
 | `InferenceError` | Architecture execution and cache/native failures. |
-| `EmbeddingError` | Empty batches, over-long texts, out-of-vocabulary or media placeholder tokens, invalid image sizes and missing vision towers; wraps tokenizer failures. Runtime evaluation exceptions remain `EmbeddingError::Exception`. |
+| `EmbeddingError` | Empty batches, over-long texts, out-of-vocabulary or media placeholder tokens, invalid image sizes, too-short or non-finite waveforms and missing media towers; wraps tokenizer failures. Runtime evaluation exceptions remain `EmbeddingError::Exception`. |
 | `GenerationError` | Prompt/stop validation, reuse and sequence limits; wraps tokenizer, sampling, cache and inference failures. Runtime evaluation exceptions remain `GenerationError::Exception`. |
 | `HubError` | Repository/revision, missing assets, unsafe paths, receipt integrity, offline miss, transport or wrapped local loading. The type exists in base builds; its API-error variant requires `hf-hub`. |
 
@@ -203,7 +205,7 @@ establish CPU throughput parity or the full real-checkpoint matrix.
 
 These capabilities require a separate approved design and qualification:
 
-- Vision and audio inputs other than EmbeddingGemma 2 image embeddings, and other multimodal inputs.
+- Vision and audio inputs other than EmbeddingGemma 2 image and audio embeddings, and other multimodal inputs.
 - Training, adapters, LoRA and distributed execution.
 - Batching, continuous generation and speculative decoding.
 - A server, async generation or arbitrary custom architecture registration.
