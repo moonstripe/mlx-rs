@@ -599,6 +599,18 @@ a 12x18 image (2x3 soft tokens) and a 6x6 image (one token) padded in one batch.
 Its mutations are channel-major patches, swapped image axes, column-major
 pooling and a missing tower value norm.
 
+`numpy_reference/embedding_gemma2_audio.py` adds the log-mel front-end (128-sample
+padding, semicausal framing, periodic Hann window, `f64` FFT magnitude, HTK mel
+bank, `log(mel + mel_floor)`, frames valid only when the following sample is real)
+and the Conformer tower in global form. Attention admits the current frame and
+`attention_context_left - 2` earlier ones: `context_left = 13` means 12 keys, as in
+transformers and mlx-vlm. `embedding-fixtures/embedding-gemma2-audio/` (tower
+weights and two waveforms from seed 1731) uses a 1600 Hz front-end with 16 mel
+bins, a 3-key window, binding clip bounds, a soft cap of 2 and gradient clipping
+of 3; 900 and 300 samples give 11 and 4 soft tokens. Its mutations are a 4-key
+window, a frame valid when its own last sample is real, unclipped linears and no
+soft cap.
+
 NumPy 2.2.6's Accelerate matmul can print spurious floating-point warnings; the
 generator rejects non-finite expectations. As provenance, not a gate: on
 2026-11-05 the reference agreed with mlx-vlm 3d87e884 on
@@ -606,4 +618,8 @@ generator rejects non-finite expectations. As provenance, not a gate: on
 bf16 execution), and the Rust Metal embeddings were bit-identical to mlx-vlm's.
 For images (a 144x240 gradient and a 96x48 noise image), the vision reference
 agreed with mlx-vlm run in f32 to 5.3e-7, and Rust bf16 agreed with mlx-vlm
-bf16 at cosine ≥ 0.99991 on Metal and ≥ 0.99967 on CPU.
+bf16 at cosine ≥ 0.99991 on Metal and ≥ 0.99967 on CPU. For audio (a 2.37 s
+chirp with noise and a 5000-sample tone), the front-end agreed with mlx-vlm's
+extractor to 1.1e-5 (as does transformers 5.22's), the audio reference agreed
+with mlx-vlm run in f32 to 3.9e-6, and Rust bf16 agreed with the reference at
+cosine ≥ 0.99994 on Metal and ≥ 0.99994 on CPU.

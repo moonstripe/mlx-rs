@@ -124,6 +124,10 @@ pub fn run(device: Device) -> Result<()> {
             embedder.embed_images(&[image]),
             Err(EmbeddingError::NoVisionTower)
         ));
+        ensure!(matches!(
+            embedder.embed_audio(&[&[0.0; 1600]]),
+            Err(EmbeddingError::NoAudioTower)
+        ));
         Ok(())
     })
 }
@@ -185,6 +189,69 @@ pub fn run_vision(device: Device) -> Result<()> {
         ensure!(matches!(
             embedder.embed_images(&[]),
             Err(EmbeddingError::EmptyBatch)
+        ));
+        Ok(())
+    })
+}
+
+pub fn run_audio(device: Device) -> Result<()> {
+    let dir = root("embedding-gemma2-audio");
+    let (atol, rtol) = tolerance(&read_json(&dir, "expectations.json")?)?;
+    let golden = Array::load_safetensors(dir.join("expectations.safetensors"))?;
+    let golden = rows(golden.get("embeddings").context("embeddings golden")?)?;
+    let stored = Array::load_safetensors(dir.join("waveforms.safetensors"))?;
+    let waves = (0..2)
+        .map(|index| -> Result<Vec<f32>> {
+            let wave = stored
+                .get(&format!("waveform{index}"))
+                .context("waveform")?;
+            Ok(wave.try_as_slice::<f32>()?.to_vec())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let refs: Vec<&[f32]> = waves.iter().map(Vec::as_slice).collect();
+
+    with_device(device, || {
+        let embedder = Embedder::from_dir(&dir)?;
+        let width = embedder.dimension();
+        let batch = embedder.embed_audio(&refs)?;
+        ensure!(batch.shape() == [2, width as i32], "batch shape differs");
+        within("audio batch", &golden, &rows(&batch)?, atol, rtol)?;
+        for (index, wave) in refs.iter().enumerate() {
+            let single = embedder.embed_audio(&[wave])?;
+            let expected = &golden[index * width..(index + 1) * width];
+            within(
+                &format!("audio {index}"),
+                expected,
+                &rows(&single)?,
+                atol,
+                rtol,
+            )?;
+        }
+
+        // 40-sample frames every 20 samples after 20 samples of left padding, then
+        // two stride-2 subsamplings: a frame is real when the sample after it is,
+        // so 20 samples give no frame and 21 give one frame and one token.
+        ensure!(matches!(
+            embedder.embed_audio(&[refs[0], &refs[1][..20]]),
+            Err(EmbeddingError::AudioTooShort {
+                input: 1,
+                samples: 20
+            })
+        ));
+        embedder.embed_audio(&[&refs[1][..21]])?;
+        let mut broken = waves[1].clone();
+        broken[7] = f32::NAN;
+        ensure!(matches!(
+            embedder.embed_audio(&[&broken]),
+            Err(EmbeddingError::NonFiniteSample { input: 0, index: 7 })
+        ));
+        ensure!(matches!(
+            embedder.embed_audio(&[]),
+            Err(EmbeddingError::EmptyBatch)
+        ));
+        ensure!(matches!(
+            embedder.embed(&["one <|audio|>"]),
+            Err(EmbeddingError::MediaToken { input: 0, .. })
         ));
         Ok(())
     })

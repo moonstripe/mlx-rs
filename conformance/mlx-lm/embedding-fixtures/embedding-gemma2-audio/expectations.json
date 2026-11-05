@@ -1,0 +1,19 @@
+{
+  "mutations_detected": [
+    "wide_window",
+    "frame_end_inclusive",
+    "no_clip",
+    "no_softcap"
+  ],
+  "provenance": "numpy 2.2.6 f32 reference, numpy_reference/embedding_gemma2_audio.py",
+  "soft_tokens": [
+    11,
+    4
+  ],
+  "tolerances": {
+    "embeddings": {
+      "atol": 0.0002,
+      "rtol": 0.0002
+    }
+  }
+}

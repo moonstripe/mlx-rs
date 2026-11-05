@@ -86,6 +86,16 @@ fn embedding_gemma2_vision_metal() -> Result<()> {
 }
 
 #[test]
+fn embedding_gemma2_audio_cpu() -> Result<()> {
+    embedding::run_audio(mlx_rs::Device::cpu())
+}
+
+#[test]
+fn embedding_gemma2_audio_metal() -> Result<()> {
+    embedding::run_audio(mlx_rs::Device::gpu())
+}
+
+#[test]
 fn gguf_mutation_qualification() -> Result<()> {
     gguf::qualify_mutations()
 }

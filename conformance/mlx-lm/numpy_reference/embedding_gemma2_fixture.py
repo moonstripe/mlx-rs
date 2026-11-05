@@ -330,7 +330,151 @@ def write_vision(directory):
     write_safetensors(directory / "expectations.safetensors", {"embeddings": batch})
 
 
-FIXTURES = {"embedding-gemma2-text": write_text, "embedding-gemma2-vision": write_vision}
+AUDIO_SEED = SEED + 2
+AUDIO_MUTATIONS = ["wide_window", "frame_end_inclusive", "no_clip", "no_softcap"]
+FRONT_END = {
+    "feature_extractor_type": "Gemma4AudioFeatureExtractor",
+    "dither": 0.0,
+    "feature_size": 16,
+    "fft_length": 64,
+    "fft_overdrive": False,
+    "frame_length": 40,
+    "hop_length": 20,
+    "input_scale_factor": 1.0,
+    "max_frequency": 800.0,
+    "mel_floor": 0.001,
+    "min_frequency": 0.0,
+    "per_bin_mean": None,
+    "per_bin_stddev": None,
+    "preemphasis": 0.0,
+    "preemphasis_htk_flavor": True,
+    "sampling_rate": 1600,
+}
+
+
+def audio_config():
+    config = json.loads(json.dumps(CONFIG))
+    config["boa_token_id"] = VOCAB.index("w2")
+    config["eoa_token_index"] = VOCAB.index("w3")
+    # Two heads of 8, a 3-key past window in chunks of 4, active clipping and soft-capping.
+    config["audio_config"] = {
+        "model_type": "gemma4_audio",
+        "attention_chunk_size": 4,
+        "attention_context_left": 4,
+        "attention_context_right": 0,
+        "attention_invalid_logits_value": -1e9,
+        "attention_logit_cap": 2.0,
+        "conv_kernel_size": 3,
+        "gradient_clipping": 3.0,
+        "hidden_act": "silu",
+        "hidden_size": 16,
+        "num_attention_heads": 2,
+        "num_hidden_layers": 2,
+        "output_proj_dims": 24,
+        "residual_weight": 0.5,
+        "rms_norm_eps": 1e-6,
+        "subsampling_conv_channels": [4, 2],
+        "use_clipped_linears": True,
+    }
+    return config
+
+
+def audio_tokenizer():
+    tokenizer = tokenizer_json()
+    vocab = tokenizer["model"]["vocab"]
+    for filler, name in (("w2", "<|audio>"), ("w3", "<audio|>")):
+        vocab[name] = vocab.pop(filler)
+        tokenizer["added_tokens"].append({"id": vocab[name], "content": name, "single_word": False,
+                                          "lstrip": False, "rstrip": False, "normalized": False, "special": True})
+    tokenizer["added_tokens"].sort(key=lambda token: token["id"])
+    return tokenizer
+
+
+def audio_weights(config):
+    c = config["audio_config"]
+    d, k = c["hidden_size"], c["conv_kernel_size"]
+    rng = np.random.Generator(np.random.PCG64(AUDIO_SEED))
+    tensors = {}
+    channels_in, bins = 1, FRONT_END["feature_size"]
+    for i, channels in enumerate(c["subsampling_conv_channels"]):
+        p = f"audio_tower.subsample_conv_projection.layer{i}."
+        tensors[p + "conv.weight"] = rng.normal(0, (9 * channels_in) ** -0.5, (channels, 3, 3, channels_in))
+        tensors[p + "norm.weight"] = rng.uniform(0.5, 1.5, (channels,))
+        channels_in, bins = channels, (bins + 2 - 3) // 2 + 1
+    tensors["audio_tower.subsample_conv_projection.input_proj_linear.weight"] = rng.normal(
+        0, (bins * channels_in) ** -0.5, (d, bins * channels_in))
+    for i in range(c["num_hidden_layers"]):
+        p = f"audio_tower.layers.{i}."
+        linears = {"feed_forward1.ffw_layer_1": (4 * d, d), "feed_forward1.ffw_layer_2": (d, 4 * d),
+                   "feed_forward2.ffw_layer_1": (4 * d, d), "feed_forward2.ffw_layer_2": (d, 4 * d),
+                   "self_attn.q_proj": (d, d), "self_attn.k_proj": (d, d), "self_attn.v_proj": (d, d),
+                   "self_attn.post": (d, d), "lconv1d.linear_start": (2 * d, d), "lconv1d.linear_end": (d, d)}
+        for name, shape in linears.items():
+            # Scales above 1/sqrt(fan-in) and tight bounds make every clamp bind somewhere.
+            tensors[p + name + ".linear.weight"] = rng.normal(0, 2.0 * shape[1] ** -0.5, shape)
+            tensors[p + name + ".input_min"] = np.array(-rng.uniform(1.0, 2.0))
+            tensors[p + name + ".input_max"] = np.array(rng.uniform(1.0, 2.0))
+            tensors[p + name + ".output_min"] = np.array(-rng.uniform(1.0, 2.0))
+            tensors[p + name + ".output_max"] = np.array(rng.uniform(1.0, 2.0))
+        for norm in ["feed_forward1.pre_layer_norm", "feed_forward1.post_layer_norm",
+                     "feed_forward2.pre_layer_norm", "feed_forward2.post_layer_norm",
+                     "lconv1d.pre_layer_norm", "lconv1d.conv_norm", "norm_pre_attn",
+                     "norm_post_attn", "norm_out"]:
+            tensors[p + norm + ".weight"] = rng.uniform(0.5, 1.5, (d,))
+        tensors[p + "lconv1d.depthwise_conv1d.weight"] = rng.normal(0, k ** -0.5, (d, k, 1))
+        tensors[p + "self_attn.per_dim_scale"] = rng.normal(0, 0.5, (d // c["num_attention_heads"],))
+        tensors[p + "self_attn.relative_k_proj.weight"] = rng.normal(0, 2.0 * d ** -0.5, (d, d))
+    out = c["output_proj_dims"]
+    tensors["audio_tower.output_proj.weight"] = rng.normal(0, d ** -0.5, (out, d))
+    tensors["audio_tower.output_proj.bias"] = rng.normal(0, 0.1, (out,))
+    tensors["embed_audio.embedding_projection.weight"] = rng.normal(
+        0, out ** -0.5, (config["text_config"]["hidden_size"], out))
+    return {name: np.asarray(value, np.float32) for name, value in tensors.items()}
+
+
+def audio_waves():
+    rng = np.random.Generator(np.random.PCG64(AUDIO_SEED))
+    t = np.arange(900) / FRONT_END["sampling_rate"]
+    chirp = 0.5 * np.sin(2 * np.pi * (60 + 300 * t) * t) + 0.05 * rng.standard_normal(t.size)
+    # 900 samples give 11 soft tokens and 300 give 4, padded in one batch.
+    return [chirp.astype(np.float32), (0.3 * rng.standard_normal(300)).astype(np.float32)]
+
+
+def write_audio(directory):
+    from numpy_reference.embedding_gemma2_audio import EmbeddingGemma2Audio
+
+    directory = Path(directory)
+    config = audio_config()
+    text = {k: v for k, v in weights().items() if not k.startswith(("vision_tower.", "embed_audio."))}
+    tensors = write_common(directory, config, audio_tokenizer(), {**text, **audio_weights(config)})
+    (directory / "preprocessor_config.json").write_text(dump(FRONT_END))
+    waves = audio_waves()
+    batch = EmbeddingGemma2Audio(config, tensors, FRONT_END).embed_audio(waves)
+    singles = np.concatenate([EmbeddingGemma2Audio(config, tensors, FRONT_END).embed_audio([w]) for w in waves])
+    if not np.isfinite(batch).all():
+        raise ValueError("reference embeddings are not finite")
+    if not np.allclose(batch, singles, atol=1e-6, rtol=0):
+        raise ValueError("reference rows depend on batch padding")
+    for mutation in AUDIO_MUTATIONS:
+        mutated = EmbeddingGemma2Audio(config, tensors, FRONT_END, mutation).embed_audio(waves)
+        excess = np.abs(mutated - batch) - (TOLERANCE["atol"] + TOLERANCE["rtol"] * np.abs(batch))
+        if excess.max() <= 0:
+            raise ValueError(f"fixture does not detect mutation {mutation}")
+    write_safetensors(directory / "waveforms.safetensors", {f"waveform{i}": w for i, w in enumerate(waves)})
+    (directory / "expectations.json").write_text(dump({
+        "provenance": f"numpy {NUMPY_VERSION} f32 reference, numpy_reference/embedding_gemma2_audio.py",
+        "tolerances": {"embeddings": TOLERANCE},
+        "mutations_detected": AUDIO_MUTATIONS,
+        "soft_tokens": [11, 4],
+    }))
+    write_safetensors(directory / "expectations.safetensors", {"embeddings": batch})
+
+
+FIXTURES = {
+    "embedding-gemma2-text": write_text,
+    "embedding-gemma2-vision": write_vision,
+    "embedding-gemma2-audio": write_audio,
+}
 
 
 def digest(directory):
